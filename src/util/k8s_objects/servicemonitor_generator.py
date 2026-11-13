@@ -7,13 +7,16 @@ metrics-server can scrape per-node resource metrics exposed by the KWOK
 controller at: /metrics/nodes/<node-name>/metrics/resource
 """
 
+from sampling import duration
+
+
 class ServiceMonitorGenerator:
     """
     A class responsible for generating ServiceMonitor custom resource objects
     for each KWOK node created in the cluster.
     """
 
-    def __init__(self):
+    def __init__(self, interval_seconds=15):
         """
         Initializes the ServiceMonitorGenerator.
         """
@@ -23,7 +26,8 @@ class ServiceMonitorGenerator:
         self.MONITORING_NAMESPACE        = "monitoring"
         self.KWOK_CONTROLLER_NAMESPACE   = "kube-system"
         self.KWOK_CONTROLLER_LABEL       = "kwok-controller"
-        self.DEFAULT_SCRAPE_INTERVAL     = "15s"
+        self.DEFAULT_SCRAPE_INTERVAL     = duration(interval_seconds)
+        self.scrape_timeout = duration(min(10, interval_seconds))
 
     def generate_service_monitor(self, node_name: str) -> dict:
         """
@@ -51,6 +55,7 @@ class ServiceMonitorGenerator:
                 "port": "http",
                 "path": metrics_path,
                 "interval": self.DEFAULT_SCRAPE_INTERVAL,
+                "scrapeTimeout": self.scrape_timeout,
             }
         ]
 

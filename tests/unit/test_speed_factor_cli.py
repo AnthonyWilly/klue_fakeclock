@@ -67,6 +67,7 @@ def shell_environment(tmp_path):
     script = (ROOT / 'execute-emulation.sh').read_text().replace('/tmp/emulation.log', str(tmp_path / 'emulation.log'))
     (tmp_path / 'execute-emulation.sh').write_text(script)
     shutil.copyfile(ROOT / 'src/experiment_clock.py', tmp_path / 'src/experiment_clock.py')
+    shutil.copyfile(ROOT / 'src/kwok_config.py', tmp_path / 'src/kwok_config.py')
     calls = tmp_path / 'calls'
     bindir = tmp_path / 'bin'
     bindir.mkdir()
@@ -77,7 +78,7 @@ import json, os, runpy, sys
 args = sys.argv[1:]
 if args[0] == '-u':
     args.pop(0)
-if args[0].endswith('experiment_clock.py'):
+if args[0].endswith(('experiment_clock.py', 'kwok_config.py')):
     sys.argv = args
     runpy.run_path(args[0], run_name='__main__')
 else:
@@ -100,7 +101,7 @@ else:
 @pytest.mark.parametrize('extra', [
     ['--speed-factor', 'nan'], ['--speed-factor', 'inf'], ['--speed-factor', '-inf'],
     ['--speed-factor', '-2'], ['--speed-factor', '.5'], ['--speed-factor', '5001'],
-    ['--speed-factor', 'oops'], ['--speed-factor'], ['--speed-factor', '--use-hpa'],
+    ['--speed-factor', 'oops'], ['--speed-factor', '7'], ['--speed-factor'], ['--speed-factor', '--use-hpa'],
     ['--speed-factor', '2', '--use-hpa'],
     ['--speed-factor', '5', '--use-karpenter', '--nodepool-path', 'np'],
     ['--speed-factor', '2', '--dev'],
@@ -125,3 +126,25 @@ def test_shell_preserves_legacy_modes_at_one(shell_environment, extra):
     result, calls = shell_environment(['--sim', '--data-path', 'trace', *extra])
     assert result.returncode == 0, result.stdout + result.stderr
     assert calls[0] == 'setup'
+
+
+def test_shell_passes_valid_worker_path_with_spaces(shell_environment, tmp_path):
+    path = tmp_path / 'worker experiment.yaml'
+    path.write_text('podPlayStageParallelism: 8')
+    result, calls = shell_environment(['--sim', '--data-path', 'trace', '--speed-factor', '2',
+                                      '--kwok-workers-config', str(path)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls[0] == 'setup'
+    arguments = json.loads(calls[1])
+    assert arguments[arguments.index('--kwok-workers-config') + 1] == str(path)
+    assert arguments[-1] == '--speed-factor=2'
+
+
+def test_python_passes_valid_worker_overrides_to_manager(tmp_path, monkeypatch):
+    path = tmp_path / 'workers.yaml'
+    path.write_text('nodeLeaseParallelism: 6')
+    monkeypatch.setattr(entrypoint.Main, 'run_tracer', Mock())
+    manager = Mock()
+    monkeypatch.setattr(entrypoint, 'Manager', manager)
+    entrypoint.main(BASE_ARGS + ['--kwok-workers-config', str(path)])
+    assert manager.call_args.kwargs['kwok_workers_config'] == str(path)

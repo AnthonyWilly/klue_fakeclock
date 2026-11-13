@@ -1,5 +1,7 @@
 import multiprocessing
 import queue
+import time
+import math
 
 from kubernetes.client.rest import ApiException
 from kubernetes.utils.quantity import parse_quantity
@@ -31,6 +33,8 @@ class UsageManager(multiprocessing.Process):
 
     def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS):
         super().__init__()
+        if not math.isfinite(reconcile_interval_seconds) or reconcile_interval_seconds <= 0:
+            raise ValueError("reconciliation interval must be positive and finite")
         self.queue = queue
         self.reconcile_interval_seconds = reconcile_interval_seconds
 
@@ -55,9 +59,8 @@ class UsageManager(multiprocessing.Process):
         """
         Main execution loop.
 
-        Waits for events from the queue. When no events arrive within
-        the timeout window, a reconciliation loop runs to ensure CRU
-        objects remain consistent with the current emulated pods set.
+        Process every event and reconcile on monotonic periodic deadlines,
+        including when the queue remains continuously occupied.
         """
 
         self.log("Process started")
@@ -68,21 +71,27 @@ class UsageManager(multiprocessing.Process):
 
         self.log("K8SAPI initialized")
 
+        self.process_events()
+
+    def process_events(self, monotonic=None):
+        """A busy queue cannot starve reconciliation; events retain FIFO order."""
+        monotonic = monotonic or time.monotonic
+        deadline = monotonic() + self.reconcile_interval_seconds
         while True:
-            try:
-                event = self.queue.get(timeout=self.reconcile_interval_seconds)
-
-                self.log(f"Event received: {event}")
-
-                if event == "STOP":
-                    self.log("Stopping UsageManager")
-                    break
-
-                self.handle_set_usage_event(event)
-
-            except queue.Empty:
-                # No event received -> perform periodic reconciliation
+            now = monotonic()
+            if now >= deadline:
                 self.reconcile_tracked_workloads()
+                # Skip expired ticks, never shift the periodic grid to event arrival.
+                now = monotonic()
+                deadline += (int((now - deadline) // self.reconcile_interval_seconds) + 1) * self.reconcile_interval_seconds
+            try:
+                event = self.queue.get(timeout=max(0, deadline - monotonic()))
+            except queue.Empty:
+                continue
+            if event == "STOP":
+                self.log("Stopping UsageManager")
+                break
+            self.handle_set_usage_event(event)
 
     # --------------------------------------------------
     # Event handling

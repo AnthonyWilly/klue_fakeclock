@@ -1,157 +1,234 @@
-"""
-Collector class is responsible for collecting metrics from a Prometheus server over a specified duration.
-It reads metric names from a file, queries Prometheus for the metrics, and writes the results to CSV files.
-The CSV files are then compressed into a zip archive for easier handling.
-"""
-
+"""Export raw Prometheus samples on one replay-anchored evaluation grid."""
 import csv
-import time
-import json
-import os
-import zipfile
+from decimal import Decimal, ROUND_FLOOR
 import glob
-from datetime import datetime, timedelta
+import math
+import os
+import time
+import zipfile
+from datetime import datetime
+from sampling import SamplingIntervals, duration, parse_duration
 import requests
 
-class Collector:
-    """
-    This class collect and process metrics from a Prometheus server.
 
-    Attributes:
-        prometheus_host (str): The base URL of the Prometheus server.
-        step (int): The step interval (in seconds) for querying metrics.
-        metrics_file (str): The file containing the list of metrics to collect.
-    """
-    def __init__(self, step, metrics_file='src/metrics.txt', prometheus_host="http://localhost:30222"):
-        """
-        Initializes the collector with the specified step interval, metrics file, 
-        and Prometheus host URL.
-        """
+class CollectionError(RuntimeError):
+    pass
+
+
+# Other metrics (including Karpenter and VPA) are optional in KWOK-only runs.
+REQUIRED_METRICS = {
+    'container_cpu_usage_seconds_total',
+    'kube_pod_container_resource_requests', 'kube_pod_container_resource_limits',
+    'kube_pod_owner', 'kube_replicaset_owner',
+}
+MEMORY_METRICS = {'container_memory_working_set_bytes', 'container_memory_usage_bytes'}
+
+
+class CollectionCursor:
+    """Integer indices avoid drift, skipped windows and off-grid batch starts."""
+    def __init__(self, origin, step):
+        self.origin = Decimal(str(origin))
+        self.step = Decimal(str(step))
+        self.next_index = 0
+
+    def timestamp(self, index):
+        return float(self.origin + index * self.step)
+
+    def window(self, confirmed_end, max_points=1000):
+        last = int(((Decimal(str(confirmed_end)) - self.origin) / self.step).to_integral_value(rounding=ROUND_FLOOR))
+        last = min(last, self.next_index + max_points - 1)
+        if last < self.next_index:
+            return None
+        return self.timestamp(self.next_index), self.timestamp(last), last
+
+    def commit(self, last):
+        self.next_index = last + 1
+
+
+class Collector:
+    def __init__(self, step, metrics_file='src/metrics.txt', prometheus_host="http://localhost:30222", intervals=None):
+        self.intervals = intervals or SamplingIntervals()
+        self.request_deadline = None
         self.prometheus_host = prometheus_host
-        self.step = int(step)
+        self.step = float(step)
+        if not math.isfinite(self.step) or self.step <= 0:
+            raise ValueError('query step must be positive and finite')
+        duration(self.step)
+        self.step = round(self.step, 3)
         self.metrics_file = metrics_file
+        self.errors = []
+        self._last_written = {}
+        self.effective_intervals = {}
 
     def log(self, message):
-        """
-        Logs a message with a "[COLLECTOR]" prefix.
-        """
         print(f"[COLLECTOR] {message}")
 
     def read_metrics(self):
-        """
-        Reads metrics from a specified file and returns them as a list of strings.
+        with open(self.metrics_file, encoding='utf-8') as stream:
+            return [line.strip() for line in stream if line.strip()]
 
-        The method opens the file specified by `self.metrics_file` in read mode,
-        reads each line, strips any leading or trailing whitespace, and stores
-        the cleaned lines in a list.
-        """
-        with open(self.metrics_file, 'r') as f:
-            metrics = [line.strip() for line in f]
-        return metrics
+    def api(self, endpoint, params=None):
+        try:
+            timeout = 10
+            if self.request_deadline is not None:
+                timeout = min(timeout, self.request_deadline - time.monotonic())
+                if timeout <= 0:
+                    raise CollectionError('real HTTP collection deadline exceeded')
+            response = requests.get(f'{self.prometheus_host}/api/v1/{endpoint}', params=params, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('status') != 'success' or 'data' not in data:
+                raise ValueError(f"Prometheus error: {data.get('error', data)}")
+            if data.get('warnings'):
+                raise ValueError(f"Prometheus warnings: {data['warnings']}")
+            return data['data']
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
+            raise CollectionError(f'{endpoint}: {error}') from error
 
     def request_metrics(self, metric, start_time, end_time):
-        """
-        Fetches metrics from a Prometheus server within a specified time range.
-        """
+        data = self.api('query_range', dict(query=metric, start=format(start_time, '.3f'),
+                        end=format(end_time, '.3f'), step=str(self.step)))
+        if not isinstance(data, dict) or data.get('resultType') != 'matrix' or not isinstance(data.get('result'), list):
+            raise CollectionError(f'invalid matrix response for {metric}')
+        return data['result']
 
-        if not self.step or self.step <= 0:
-            self.log(f"[ERROR] Invalid step value: {self.step}. It must be a positive integer.")
-            return None
+    @staticmethod
+    def require_metrics(available):
+        missing = REQUIRED_METRICS - available
+        if missing or not (MEMORY_METRICS & available):
+            raise CollectionError(f'required metrics absent: {sorted(missing)}; memory available: {sorted(MEMORY_METRICS & available)}')
 
+    def targets(self, intervals, nodes=()):
+        """Inspect loaded target configuration and completed scrapes, not applied manifests."""
+        data = self.api('targets', {'state': 'active'})
+        kwok, ksm = [], []
+        for target in data['activeTargets']:
+            url = target.get('scrapeUrl', '')
+            pool = target.get('scrapePool', '')
+            if '/metrics/nodes/' in url:
+                kwok.append(target)
+            elif pool == 'serviceMonitor/monitoring/kube-state-metrics/0':
+                ksm.append(target)
+        if not ksm or not kwok or any(not any(f'/metrics/nodes/{node}/' in t['scrapeUrl'] for t in kwok) for node in nodes):
+            raise CollectionError('required scrape targets are not active')
+        for group, interval, key in ((kwok, intervals.kwok, 'kwok'), (ksm, intervals.ksm, 'kube_state_metrics')):
+            for target in group:
+                if (target.get('health') != 'up' or parse_duration(target['scrapeInterval']) != interval
+                        or parse_duration(target['scrapeTimeout']) > interval):
+                    raise CollectionError(f'{key} target not ready at requested interval {duration(interval)}')
+            self.effective_intervals[key] = interval
+        timestamps = []
+        for target in kwok + ksm:
+            timestamps.append(datetime.fromisoformat(target['lastScrape'].replace('Z', '+00:00')).timestamp())
+        return min(timestamps)
+
+    def wait_ready(self, intervals, nodes=(), timeout=180, monotonic=time.monotonic, wait=time.sleep, unix_time=time.time):
+        previous_deadline = self.request_deadline
+        self.request_deadline = time.monotonic() + timeout
         try:
-            step_duration = f"{self.step}s"
-            response = requests.get(
-                f"{self.prometheus_host}/api/v1/query_range",
-                params={
-                    "query": metric,
-                    "start": start_time,
-                    "end": end_time,
-                    "step": step_duration
-                }
-            )
+            deadline = monotonic() + timeout
+            while True:
+                try:
+                    self.targets(intervals, nodes)
+                    available = set()
+                    for metric in self.read_metrics():
+                        if metric in REQUIRED_METRICS | MEMORY_METRICS:
+                            data = self.api('query', {'query': f'timestamp({metric})'})
+                            interval = intervals.kwok if metric.startswith('container_') else intervals.ksm
+                            values = data.get('result', [])
+                            if values and all(math.isfinite(float(item['value'][1])) and
+                                              unix_time() - float(item['value'][1]) <= interval + min(10, interval) + .001
+                                              for item in values):
+                                available.add(metric)
+                    self.require_metrics(available)
+                    return dict(self.effective_intervals)
+                except (CollectionError, KeyError, TypeError, ValueError) as error:
+                    if monotonic() >= deadline:
+                        raise CollectionError(f'observability readiness timed out: {error}') from error
+                    wait(min(1, max(0, deadline - monotonic())))
+        finally:
+            self.request_deadline = previous_deadline
 
-            if response.status_code != 200:
-                self.log(f"[ERROR] Failed to fetch metric {metric}: {response.text}")
-                return None
+    def validate_source_samples(self, metric, results, start, end):
+        """PromQL lookback must not hide a scrape outage behind repeated values."""
+        if not results:
+            return
+        sources = self.request_metrics(f'timestamp({metric})', start, end)
+        interval = self.intervals.kwok if metric.startswith('container_') else self.intervals.ksm
+        max_age = interval + min(10, interval)  # Allow one real scrape timeout for ingestion.
+        observed = {}
+        for series in sources:
+            labels = tuple(sorted((key, value) for key, value in series['metric'].items() if key != '__name__'))
+            for timestamp, source_timestamp in series['values']:
+                observed[(labels, round(float(timestamp), 3))] = float(source_timestamp)
+        for series in results:
+            labels = tuple(sorted((key, value) for key, value in series['metric'].items() if key != '__name__'))
+            for timestamp, _ in series['values']:
+                source = observed.get((labels, round(float(timestamp), 3)))
+                if source is None or not math.isfinite(source) or float(timestamp) - source > max_age + .001:
+                    raise CollectionError(f'{metric}: missing or stale scrape at {timestamp}')
 
-            return response.json()
-        except requests.RequestException as e:
-            self.log(f"[ERROR] Request exception for metric {metric}: {e}")
-            return None
-
-    def write_csv(self, output_dir, start_time, end_time):
-        """
-        Writes metrics data to CSV files in the specified output directory.
-
-        This method iterates over a list of metrics, retrieves their data using
-        the `request_metrics` method, and writes the results to individual CSV
-        files. Each file is named after the metric's name and contains rows of
-        timestamped values along with their associated labels.
-        """
-        self.log(f"[INFO] Writing CSV files to {output_dir}")
-        for metric in self.metrics:
-            data = self.request_metrics(metric, start_time, end_time)
-
-            if data is None:
-                continue
-
-            try:
-                results = data.get("data", {}).get("result", [])
-            except json.JSONDecodeError:
-                self.log(f"[ERROR] Failed to decode JSON for metric {metric}")
-                continue
-
-            if len(results) == 0:
-                self.log(f"[INFO] No results for metric {metric}")
-                continue
-
-            metric_name = results[0]["metric"].get("__name__", "")
-
-            file_path = f"{output_dir}/{metric_name}.csv"
-            file_exists = os.path.isfile(file_path)
-
-            with open(f"{output_dir}/{metric_name}.csv", "a", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                
-                # pega todas as labels possíveis (mais seguro)
-                labelnames = sorted({
-                    key
-                    for result in results
-                    for key in result["metric"].keys()
-                })
-
-                if not file_exists:
-                    writer.writerow(["name", "timestamp", "value"] + labelnames)
-
-                for result in results:
-                    for values in result["values"]:
-                        timestamp = values[0]
-                        value = values[1]
-                        row = [result["metric"].get("__name__", ""), timestamp, value]
-                        for label in labelnames:
-                            x = result["metric"].get(label, "")
-                            row.append(x)
-                        writer.writerow(row)
+    def _write(self, output_dir, metric, results):
+        if not results:
+            return
+        path = os.path.join(output_dir, f'{metric}.csv')
+        labels = sorted({key for result in results for key in result['metric']})
+        old_labels = []
+        if os.path.exists(path):
+            with open(path, newline='', encoding='utf-8') as stream:
+                old_labels = next(csv.reader(stream))[3:]
+        labels = sorted(set(labels) | set(old_labels))
+        header = ['name', 'timestamp', 'value'] + labels
+        # Schema grows only when a new label appears. Rewrite old rows by name,
+        # never append differently ordered columns under an existing header.
+        if old_labels != labels and os.path.exists(path):
+            with open(path, newline='', encoding='utf-8') as source, open(path + '.tmp', 'w', newline='', encoding='utf-8') as dest:
+                reader = csv.DictReader(source)
+                writer = csv.DictWriter(dest, header, restval='')
+                writer.writeheader()
+                writer.writerows(reader)
+            os.replace(path + '.tmp', path)
+        exists = os.path.exists(path)
+        committed = dict(self._last_written)
+        with open(path, 'a', newline='', encoding='utf-8') as stream:
+            writer = csv.writer(stream)
+            if not exists:
+                writer.writerow(header)
+            for result in results:
+                series = tuple(sorted(result['metric'].items()))
+                key = (metric, series)
+                for timestamp, value in sorted(result['values'], key=lambda pair: float(pair[0])):
+                    if float(timestamp) <= committed.get(key, -math.inf):
+                        continue
+                    writer.writerow([result['metric'].get('__name__', metric), timestamp, value] +
+                                    [result['metric'].get(label, '') for label in labels])
+                    committed[key] = float(timestamp)
+        self._last_written = committed
 
     def collect(self, start_time, end_time, output_dir):
-        """
-        Collects metrics for a specified duration and appends them to CSV files.
-
-        Steps:
-            1. Logs the start of the metric collection process.
-            2. Reads the metrics and stores them.
-            3. Creates a timestamped output directory for the CSV files.
-            4. Writes the collected metrics to CSV files in the output directory.
-
-        The CSV files are not archived here: call `archive()` once, after the
-        last collection, so the dataset is compressed a single time instead of
-        being re-zipped on every cycle.
-        """
-        self.log(f"[INFO] Collecting metrics from {start_time} to {end_time}")
-        self.metrics = self.read_metrics()
-
-        os.makedirs(output_dir, exist_ok=True)
-        self.write_csv(output_dir, start_time, end_time)
+        """Commit a batch only after all queries and mandatory grid checks succeed."""
+        try:
+            batches = {metric: self.request_metrics(metric, start_time, end_time) for metric in self.read_metrics()}
+            cursor = CollectionCursor(start_time, self.step)
+            window = cursor.window(end_time, max_points=11000)
+            expected = {round(cursor.timestamp(index), 3) for index in range(window[2] + 1)}
+            available_by_time = {timestamp: set() for timestamp in expected}
+            for metric, results in batches.items():
+                for result in results:
+                    for timestamp, value in result['values']:
+                        timestamp = round(float(timestamp), 3)
+                        if timestamp in available_by_time:
+                            available_by_time[timestamp].add(metric)
+            for available in available_by_time.values():
+                self.require_metrics(available)
+            for metric, results in batches.items():
+                self.validate_source_samples(metric, results, start_time, end_time)
+            os.makedirs(output_dir, exist_ok=True)
+            for metric, results in batches.items():
+                self._write(output_dir, metric, results)
+        except (CollectionError, KeyError, TypeError, ValueError, OSError) as error:
+            self.errors.append(dict(start=start_time, end=end_time, error=str(error)))
+            raise CollectionError(f'collection {start_time}..{end_time}: {error}') from error
 
     def archive(self, output_dir):
         """

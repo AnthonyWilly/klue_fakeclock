@@ -112,7 +112,9 @@ Use static infrastructure and/or workload:
 
 Use `--speed-factor F` to scale trace replay deadlines, the final 15-second
 logical observation tail, and workload usage reconciliation. The default is
-`1`; finite fractional factors are supported. Acceleration requires emulation
+`1`; finite fractional factors are supported when both scrape intervals can be
+represented in whole milliseconds. For example, `1.5` and `8` are supported,
+whereas `7` is rejected before setup. Acceleration requires emulation
 without HPA or Karpenter. Development mode and autoscaling modes accept only
 `1`. Factors must be between `1` and `5000` so the shortest logical interval
 (5 seconds) remains at least 1 millisecond in real time.
@@ -122,7 +124,7 @@ without HPA or Karpenter. Development mode and autoscaling modes accept only
 ```
 
 Infrastructure and workload share an origin established after preparation and
-Prometheus port-forward readiness. Overdue events run in input order without
+Prometheus port-forward and sampling readiness. Overdue events run in input order without
 changing the requested factor or shifting later deadlines. Static modes still
 wait through the trace duration. API, readiness and cleanup timeouts remain in
 real seconds; preparation and total runtime need not accelerate proportionally.
@@ -131,8 +133,59 @@ Replay diagnostics are available in memory through each manager's
 `replay_diagnostics.snapshot()`: entry counts, skipped actions, call outcomes,
 real/logical lag and action timing. A successful usage queue delivery does not
 mean reconciliation completed, and a successful API call does not establish
-cluster convergence. Scraping and CSV export retain their existing cadence;
-this option alone does not guarantee equivalent sampling at accelerated rates.
+cluster convergence.
+
+Sampling uses logical intervals divided by the requested factor: usage
+reconciliation every 5 seconds, KWOK scrape every 15 seconds, and the main
+kube-state-metrics scrape and query grid every 30 seconds. For 1×/2×/5×,
+KWOK uses 15/7.5/3 real seconds and queries use 30/15/6 real seconds.
+Reconciliation runs on monotonic deadlines even while usage events arrive
+continuously. Every event is processed in queue order.
+
+Before replay, KLUE overlays the main kube-state-metrics endpoint, reconciles
+node ServiceMonitors, checks the loaded Prometheus targets and intervals, and
+waits for fresh CPU, memory, requests, limits and owner metrics. The readiness
+timeout is 180 real seconds. The kube-state-metrics self endpoint is unchanged.
+The Prometheus HTTP API supports a [fractional query step](https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries).
+
+CSV exports keep real Unix timestamps at millisecond precision and unmodified
+values: cumulative CPU in core-seconds, memory in bytes, requests and limits.
+Batches share one evaluation grid starting at the replay origin. Failed batches
+retain their cursor for retry; overlapping series/timestamps are deduplicated,
+and new labels extend the file schema. Optional Karpenter/VPA metrics may be
+absent. Missing required evaluations, HTTP/JSON/Prometheus errors and stale
+source scrapes are exposed as collection errors. Source samples older than
+one configured scrape interval plus its scrape timeout are rejected rather
+than hidden by Prometheus lookback.
+
+Stopping wakes collection immediately and flushes every grid point through the
+replay's observation tail, including executions shorter than one batch cycle.
+Final ingestion has a 60-real-second budget, including HTTP requests. The
+coordinator exposes `collection_error`, `collection_diagnostics`, and
+`observability` (requested/effective intervals, installed worker counts and
+KWOK images) for execution diagnostics. CSV files are archived once after
+collection. These checks establish sampling availability, not fidelity of an
+accelerated execution; evaluate that separately on the target machine.
+
+#### KWOK worker experiments
+
+`--kwok-workers-config PATH` accepts a YAML or JSON mapping containing any of
+`podPlayStageParallelism`, `nodePlayStageParallelism`, and
+`nodeLeaseParallelism`. Values must be positive uint32 integers. Omitted fields
+retain the installed release configuration; without the flag KLUE does not
+override worker counts. Unknown fields and invalid values fail before setup.
+The overrides are merged into the release's `kwok` ConfigMap
+(`config.kwok.x-k8s.io/v1alpha1`, `KwokConfiguration`); setup restarts the
+controller to load its mounted config. Lease duration and other options are
+preserved. This follows the [KWOK configuration contract](https://kwok.sigs.k8s.io/docs/user/configuration/).
+
+```bash
+./execute-emulation.sh --sim --use-cluster <cluster-context> --data-path <trace-path> --speed-factor 2 --kwok-workers-config /absolute/path/workers.yaml
+```
+
+Use the same KWOK image, trace and machine when comparing worker settings.
+Worker counts are an experiment parameter; no increased defaults or speedup
+are assumed.
 
 #### 6. **Playground (Development) Mode**
 Set up a development environment (no emulation), it's just for test Karpenter actions manually:

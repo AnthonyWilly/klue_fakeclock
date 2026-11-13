@@ -215,7 +215,12 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
             pass
     monkeypatch.setattr(coordinator.threading, 'Thread', Thread)
     instance = coordinator.Manager(karpenter=False, hpa=False, speed_factor=2)
+    def prepare_observability():
+        assert clock.origin_monotonic is None
+        time.wait(2)
+    instance.prepare_observability = Mock(side_effect=prepare_observability)
     instance.run()
+    instance.prepare_observability.assert_called_once()
     assert commands[-1] == ['bash', 'src/port-forward.sh']
     assert clock.origin_monotonic > 100
     for name in ('InfrastructureManager', 'WorkloadManager'):
@@ -242,6 +247,7 @@ def test_usage_process_uses_serialized_interval(monkeypatch):
     queue.get.return_value = 'STOP'
     monkeypatch.setattr(usage_module, 'K8SAPI', Mock())
     usage = UsageManager(queue, reconcile_interval_seconds=2.5)
+    monkeypatch.setattr(usage_module.time, 'monotonic', lambda: 100)
     usage.run()
     queue.get.assert_called_once_with(timeout=2.5)
     usage_module.K8SAPI.assert_called_once_with(timeout=200)

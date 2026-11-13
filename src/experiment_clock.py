@@ -24,6 +24,12 @@ def validate_speed_factor(value, karpenter=False, hpa=False, development=False):
         raise ValueError("speed-factor must be a finite number >= 1")
     if any(interval / factor < MIN_INTERVAL_SECONDS for interval in LOGICAL_INTERVALS):
         raise ValueError("speed-factor produces experiment intervals below 1 ms")
+    # Prometheus scrape durations have millisecond precision. Do not silently
+    # round the requested experiment resolution.
+    for interval in (15, 30):
+        milliseconds = interval * 1000 / factor
+        if not math.isclose(milliseconds, round(milliseconds), rel_tol=0, abs_tol=1e-7):
+            raise ValueError("speed-factor produces sampling intervals not representable in milliseconds")
     if factor > 1 and (karpenter or hpa or development):
         raise ValueError("speed-factor > 1 requires emulation without HPA or Karpenter")
     return factor
@@ -42,7 +48,7 @@ class ExperimentClock:
         if self.origin_monotonic is not None:
             raise RuntimeError("experiment clock already started")
         self.origin_monotonic = self.monotonic()
-        self.origin_unix = self.unix_time()
+        self.origin_unix = math.floor(self.unix_time() * 1000) / 1000
         return self
 
     def real_duration(self, logical_seconds):

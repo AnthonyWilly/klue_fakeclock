@@ -18,10 +18,10 @@ class ServiceMonitorManager:
     ServiceMonitors in sync with the live set of KWOK fake nodes.
     """
 
-    def __init__(self):
+    def __init__(self, interval_seconds=15):
         self.k8s_api = K8SAPI()
         self.k8s_object_applier = KubernetesObjectApplier(self.k8s_api)
-        self.servicemonitor_generator = ServiceMonitorGenerator()
+        self.servicemonitor_generator = ServiceMonitorGenerator(interval_seconds)
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -32,6 +32,14 @@ class ServiceMonitorManager:
 
     def log(self, message):
         print(f"[SERVICE MONITOR WATCHER] {message}", flush=True)
+
+    def prepare(self):
+        """Synchronously configure nodes created during setup before replay readiness."""
+        nodes = self.k8s_api.v1.list_node().items
+        names = [node.metadata.name for node in nodes if self._is_fake_node(node)]
+        for name in names:
+            self._on_node_added(name, strict=True)
+        return names
 
     def start(self):
         self.log("Starting.")
@@ -111,7 +119,7 @@ class ServiceMonitorManager:
     # Event handlers
     # ------------------------------------------------------------------
 
-    def _on_node_added(self, node_name: str):
+    def _on_node_added(self, node_name: str, strict=False):
         try:
             self.k8s_api.v1.patch_node(node_name, {
                 "metadata": {
@@ -130,6 +138,8 @@ class ServiceMonitorManager:
             self.log(f"[INFO] ServiceMonitor created for node {node_name}.")
         except Exception as e:
             self.log(f"[ERROR] Failed to create ServiceMonitor for node {node_name}: {e}")
+            if strict:
+                raise
 
     def _on_node_deleted(self, node_name: str):
         try:

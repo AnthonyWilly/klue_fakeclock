@@ -1,3 +1,10 @@
+# Validate before any setup command, including direct invocation.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$SCRIPT_DIR/../src/experiment_clock.py" --speed-factor="${KLUE_SPEED_FACTOR:-1}" || exit $?
+if [[ -n ${KLUE_KWOK_WORKERS_CONFIG:-} ]]; then
+    python3 "$SCRIPT_DIR/../src/kwok_config.py" validate --workers-config "$KLUE_KWOK_WORKERS_CONFIG" || exit $?
+fi
+
 go install github.com/google/ko@latest
 export PATH=$PATH:~/go/bin
 
@@ -21,6 +28,15 @@ kubectl wait \
 	--all CustomResourceDefinition \
 	--namespace=monitoring
 kubectl apply -f kube-prometheus/manifests/
+# Main metrics endpoint only; preserve the installed monitor's other fields.
+KSM_OVERLAY=$(mktemp) || exit $?
+if ! kubectl -n monitoring get servicemonitor kube-state-metrics -o json > "$KSM_OVERLAY"; then
+    rm -f "$KSM_OVERLAY"
+    exit 1
+fi
+python3 "$SCRIPT_DIR/../src/kwok_config.py" ksm --speed-factor="${KLUE_SPEED_FACTOR:-1}" < "$KSM_OVERLAY" > "$KSM_OVERLAY.patched" || exit $?
+kubectl apply -f "$KSM_OVERLAY.patched" || exit $?
+rm -f "$KSM_OVERLAY" "$KSM_OVERLAY.patched"
 
 docker login
 
@@ -38,7 +54,7 @@ if [ "$KARPENTER" = "karpenter-on" ]; then
 	kubectl apply -f configuration-files/karpenter-servicemonitor.yml
 fi
 
-./install-kwok.sh
+./install-kwok.sh || exit $?
 
 while true; do
 	STATUS=$(kubectl get pod prometheus-k8s-0 -n monitoring \
