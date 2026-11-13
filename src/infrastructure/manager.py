@@ -5,6 +5,7 @@ for trace-driven experiments. It handles applying Kubernetes objects, managing n
 
 import json
 import time
+from experiment_clock import ExperimentClock, ReplayDiagnostics, replay_entries, validate_speed_factor
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_object_applier import KubernetesObjectApplier
 
@@ -12,10 +13,11 @@ class InfrastructureManager:
     TIME_OUT = 200
     AMOUNT_OF_REAL_NODES = 1
 
-    def __init__(self, data_path, karpenter, emulation_phase):
+    def __init__(self, data_path, karpenter, emulation_phase, speed_factor=1):
         """
         Initializes the Manager class.
         """
+        self.speed_factor = validate_speed_factor(speed_factor, karpenter=karpenter)
         self.karpenter = karpenter
         self.emulation_phase = emulation_phase
 
@@ -25,6 +27,7 @@ class InfrastructureManager:
         with open(data_path, 'r', encoding="utf-8") as file:
             self.data = json.load(file)
 
+        self.replay_diagnostics = ReplayDiagnostics(len(self.data['emulation']))
         self.input_data_node_count = self.count_nodes_in_input_data()
         self.node_count = 0
 
@@ -75,67 +78,20 @@ class InfrastructureManager:
             self.log("[INFO] Restoring nodepools disruption time to original values.")
             self.restore_nodepools_disruption_time()
 
-    def emulation(self):
-        """
-        Executes the main emulation loop based on trace data.
-
-        This method processes a series of time-stamped entries from the trace
-        data (`self.data['emulation']`). It aims to synchronize the execution
-        of events in the trace with the progression of wall clock time.
-        The `entry["timestamp"]` is interpreted as an offset from the start
-        of the emulation.
-
-        Key operations:
-        1. Records the wall clock time at the start of the emulation.
-        2. For each entry in the trace:
-           a. Calculates the target wall clock time for the event based on its
-              timestamp relative to the emulation start.
-           b. Determines the necessary sleep duration to align the current
-              wall clock time with the target event time.
-           c. Sleeps if needed to simulate the passage of time until the event.
-           d. If `self.emulation_phase` is "dynamic":
-              i. Applies node objects specified in `entry.get('applied_objects', [])`.
-              ii. Deletes nodes specified by name in `entry.get('deleted_objects', [])`,
-        """
-        trace = self.data['emulation']
-
-        emulation_start_wall_clock_time = time.monotonic()
-        self.log(f"[INFO] Emulation start time (wall clock): {emulation_start_wall_clock_time:.4f}")
-
-        for entry in trace:
-            entry_trace_timestamp = entry["timestamp"]
-
-            # 1. Calculate the target wall clock time for the START of this event
-            target_event_start_wall_clock_time = emulation_start_wall_clock_time + entry_trace_timestamp
-
-            # 2. Get the current wall clock time
-            current_wall_clock_time = time.monotonic()
-
-            # 3. Calculate how long we need to sleep
-            sleep_duration_needed = target_event_start_wall_clock_time - current_wall_clock_time
-
-            if sleep_duration_needed > 0:
-                time.sleep(sleep_duration_needed)
-            
-            if self.emulation_phase == "dynamic":
-                for node in entry.get('applied_objects', []):
-                    try:
-                        node_name = node['metadata']['name']
-                        self.k8s_object_applier.apply_node(node, node['metadata']['name'])
-                        self.log(f"[INFO] Node {node_name} applied.")
-                    except Exception as e:
-                        self.log(f"[ERROR] Failed to apply node {node.get('metadata', {}).get('name', '')}: {e}")
-
-                for node_name in entry.get('deleted_objects', []):
-                    try:
-                        self.k8s_api.delete_infrastructure_object(node_name)
-                        self.log(f"[INFO] Node {node_name} deleted.")
-                    except Exception as e:
-                        self.log(f"[ERROR] Failed to delete node {node_name}: {e}")
-
-        # The last timestamp in the trace does not matter (it represents the tear down phase),
-        # so we can just sleep for the input step duration.
-        time.sleep(15)
+    def emulation(self, clock=None):
+        """Replay infrastructure against the coordinator's common origin."""
+        clock = clock or ExperimentClock(self.speed_factor).start()
+        for entry, scheduled in replay_entries(
+                self.data['emulation'], clock, self.replay_diagnostics,
+                self.emulation_phase == "dynamic"):
+            for node in entry.get('applied_objects', []):
+                self.replay_diagnostics.apply(
+                    clock, scheduled, {"action": "apply-node", "object": node},
+                    self.k8s_object_applier.apply_node, node, node['metadata']['name'])
+            for name in entry.get('deleted_objects', []):
+                self.replay_diagnostics.apply(
+                    clock, scheduled, {"action": "delete-node", "name": name},
+                    self.k8s_api.delete_infrastructure_object, name)
 
     def tear_down(self):
         pass

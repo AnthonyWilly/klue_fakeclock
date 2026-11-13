@@ -108,6 +108,32 @@ Use static infrastructure and/or workload:
 ```
 **OBS:** The `<trace-path>` should not ends with /, you need to provide a path in the format /path/to/trace
 
+#### Replay speed
+
+Use `--speed-factor F` to scale trace replay deadlines, the final 15-second
+logical observation tail, and workload usage reconciliation. The default is
+`1`; finite fractional factors are supported. Acceleration requires emulation
+without HPA or Karpenter. Development mode and autoscaling modes accept only
+`1`. Factors must be between `1` and `5000` so the shortest logical interval
+(5 seconds) remains at least 1 millisecond in real time.
+
+```bash
+./execute-emulation.sh --sim --use-cluster <cluster-context> --data-path <trace-path> --speed-factor 2
+```
+
+Infrastructure and workload share an origin established after preparation and
+Prometheus port-forward readiness. Overdue events run in input order without
+changing the requested factor or shifting later deadlines. Static modes still
+wait through the trace duration. API, readiness and cleanup timeouts remain in
+real seconds; preparation and total runtime need not accelerate proportionally.
+
+Replay diagnostics are available in memory through each manager's
+`replay_diagnostics.snapshot()`: entry counts, skipped actions, call outcomes,
+real/logical lag and action timing. A successful usage queue delivery does not
+mean reconciliation completed, and a successful API call does not establish
+cluster convergence. Scraping and CSV export retain their existing cadence;
+this option alone does not guarantee equivalent sampling at accelerated rates.
+
 #### 6. **Playground (Development) Mode**
 Set up a development environment (no emulation), it's just for test Karpenter actions manually:
 ```bash

@@ -10,7 +10,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Função para exibir a ajuda
 usage() {
-    echo "Uso: $0 [--dev | --sim] [--use-cluster CONTEXT] [--data-path PATH] [--nodepool-path PATH] [--use-karpenter] [--use-hpa] [--skip-tracer] [--static-infra] [--static-workload] [-h | --help]"
+    echo "Uso: $0 [--dev | --sim] [--use-cluster CONTEXT] [--data-path PATH] [--nodepool-path PATH] [--use-karpenter] [--use-hpa] [--skip-tracer] [--static-infra] [--static-workload] [--speed-factor F] [-h | --help]"
     echo ""
     echo "Opções:"
     echo "  --dev                 Criar ambiente de desenvolvimento"
@@ -23,6 +23,7 @@ usage() {
     echo "  --skip-tracer         Pular a execução do tracer"
     echo "  --static-infra        Usar infraestrutura estática na emulação"
     echo "  --static-workload     Usar workload estático na emulação"
+    echo "  --speed-factor F      Fator finito >= 1 (padrão 1; aceleração sem HPA/Karpenter)"
     echo "  -h, --help            Exibir esta mensagem de ajuda"
     exit 1
 }
@@ -45,9 +46,18 @@ KARPENTER="karpenter-off"
 INFRASTRUCTURE="dynamic"
 WORKLOAD="dynamic"
 HPA="hpa-off"
+SPEED_FACTOR="1"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --speed-factor)
+            if [[ $# -lt 2 || $2 == --* ]]; then
+                echo "Erro: --speed-factor requer um valor."
+                exit 1
+            fi
+            SPEED_FACTOR="$2"
+            shift 2
+            ;;
         --dev)
             ENVIRONMENT="development"
             shift
@@ -120,6 +130,13 @@ if [[ $ENVIRONMENT == "emulation" && $KARPENTER == "karpenter-on" && -z $NODEPOO
     usage
 fi
 
+# Dependency-free Python preflight runs before setup or cluster access.
+speed_args=(--speed-factor="$SPEED_FACTOR")
+[[ $KARPENTER == "karpenter-on" ]] && speed_args+=(--karpenter)
+[[ $HPA == "hpa-on" ]] && speed_args+=(--hpa)
+[[ $ENVIRONMENT == "development" ]] && speed_args+=(--development)
+python3 "$(dirname "${BASH_SOURCE[0]}")/src/experiment_clock.py" "${speed_args[@]}" || exit $?
+
 # Configuração do ambiente
 if [[ $ENVIRONMENT == "development" ]]; then
     echo "Configurando ambiente de desenvolvimento..."
@@ -130,5 +147,5 @@ elif [[ $ENVIRONMENT == "emulation" ]]; then
     cd kwok-karpenter-install
     ./setup.sh "$KARPENTER"
     cd ..
-    python3 -u src/main.py "$TRACE_PATH" "$NODEPOOL_PATH" "$KARPENTER" "$TRACER" "$INFRASTRUCTURE" "$WORKLOAD" "$HPA"
+    python3 -u src/main.py "$TRACE_PATH" "$NODEPOOL_PATH" "$KARPENTER" "$TRACER" "$INFRASTRUCTURE" "$WORKLOAD" "$HPA" --speed-factor="$SPEED_FACTOR"
 fi

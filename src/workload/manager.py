@@ -4,6 +4,7 @@ This module defines the WorkloadManager class, which serves as a base class for 
 
 import json
 import time
+from experiment_clock import ExperimentClock, ReplayDiagnostics, replay_entries, validate_speed_factor
 from kubernetes import client
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_object_applier import KubernetesObjectApplier
@@ -12,10 +13,11 @@ from workload.usage.usage_manager import UsageManager
 
 class WorkloadManager:
     TIME_OUT = 200
-    def __init__(self, data_path, emulation_phase, hpa):
+    def __init__(self, data_path, emulation_phase, hpa, speed_factor=1):
         """
         Initializes the Workload Manager class.
         """
+        self.speed_factor = validate_speed_factor(speed_factor, hpa=hpa)
         self.BEFORE_EMULATION_KINDS = {
             "horizontalpodautoscaler",
         }
@@ -29,8 +31,9 @@ class WorkloadManager:
         with open(data_path, 'r', encoding="utf-8") as file:
             self.data = json.load(file)
         
+        self.replay_diagnostics = ReplayDiagnostics(len(self.data['emulation']))
         self.usage_queue = multiprocessing.Queue()
-        self.usage_manager = UsageManager(self.usage_queue)
+        self.usage_manager = UsageManager(self.usage_queue, reconcile_interval_seconds=5 / self.speed_factor)
 
     def log(self, message):
         """
@@ -83,6 +86,8 @@ class WorkloadManager:
                 self.scale_workload(workload_action)
 
     def before_emulation(self):
+        if not self.hpa:
+            return
         setup = self.data["setup"]
 
         applied_objects = setup["applied_objects"]
@@ -94,71 +99,61 @@ class WorkloadManager:
                 if object.get("kind", "").lower() in self.BEFORE_EMULATION_KINDS:
                     self.k8s_object_applier.apply_object(object)
 
-    def emulation(self):
-        """
-        Executes a trace by applying, scaling, and deleting Kubernetes objects based on the provided trace data.
-        The method processes a sequence of trace entries, where each entry contains information about
-        objects to be applied, scaled, or deleted in a Kubernetes cluster. It simulates the timing of
-        operations based on timestamps in the trace and logs the actions performed.
-        Steps:
-        1. Reads the trace data and initializes the current timestamp.
-        2. Simulates time progression using `time.sleep` based on the difference between consecutive timestamps.
-        3. Applies Kubernetes objects and creates namespaces if they do not exist.
-        4. Scales deployments or stateful sets to the specified number of replicas.
-        """
-        trace = self.data['emulation']
+    def emulation(self, clock=None):
+        """Replay workload entries without changing trace timestamps or units."""
+        clock = clock or ExperimentClock(self.speed_factor).start()
+        diagnostics = self.replay_diagnostics
+        for entry, scheduled in replay_entries(
+                self.data['emulation'], clock, diagnostics,
+                self.emulation_phase == "dynamic"):
+            for namespace, objects in entry.get('applied_objects', {}).items():
+                for obj in objects:
+                    if self.ignore_hpa(obj):
+                        diagnostics.skip()
+                        continue
+                    diagnostics.apply(
+                        clock, scheduled, {"action": "apply-object", "object": obj},
+                        self.apply_workload_object, namespace, obj)
+            for action in entry.get('workload_actions', []):
+                kind = action['action']
+                if kind == 'set-usage':
+                    # Queue metadata is serializable; the child process starts
+                    # before the common clock origin exists in the parent.
+                    event = dict(action, replay_timing={
+                        "scheduled_monotonic": scheduled,
+                        "trace_timestamp": entry['timestamp'],
+                        "origin_monotonic": clock.origin_monotonic,
+                        "origin_unix": clock.origin_unix,
+                        "speed_factor": clock.speed_factor,
+                    })
+                    diagnostics.apply(clock, scheduled, {"action": "queue-usage"},
+                                      self.set_workload_usage, event)
+                elif kind == 'scale' and not self.hpa:
+                    diagnostics.apply(clock, scheduled, action,
+                                      self.scale_workload, action)
+                elif kind == 'scale':
+                    diagnostics.skip()
+                else:
+                    diagnostics.apply(clock, scheduled, action,
+                                      self.unsupported_action, kind)
+            for obj in entry.get('deleted_objects', []):
+                if self.ignore_hpa(obj):
+                    diagnostics.skip()
+                    continue
+                diagnostics.apply(clock, scheduled,
+                                  {"action": "delete-object", "object": obj},
+                                  self.k8s_object_applier.delete_object, obj)
 
-        emulation_start_wall_clock_time = time.monotonic()
-        self.log(f"[INFO] Emulation start time (wall clock): {emulation_start_wall_clock_time:.4f}")
+    def ignore_hpa(self, obj):
+        return not self.hpa and obj.get('kind', '').lower() == 'horizontalpodautoscaler'
 
-        for entry in trace:
-            entry_trace_timestamp = entry["timestamp"]
+    def apply_workload_object(self, namespace, obj):
+        self.create_namespace_if_not_exists(namespace)
+        self.k8s_object_applier.apply_object(obj)
 
-            # 1. Calculate the target wall clock time for the START of this event
-            target_event_start_wall_clock_time = emulation_start_wall_clock_time + entry_trace_timestamp
-
-            # 2. Get the current wall clock time
-            current_wall_clock_time = time.monotonic()
-
-            # 3. Calculate how long we need to sleep
-            sleep_duration_needed = target_event_start_wall_clock_time - current_wall_clock_time
-
-            if sleep_duration_needed > 0:
-                time.sleep(sleep_duration_needed)
-
-            if self.emulation_phase == "dynamic":
-                # Apply workload objects
-                self.log(f"[INFO] Processing entry at timestamp {entry_trace_timestamp}")
-                for namespace, objects in entry.get('applied_objects', {}).items():
-                    try:
-                        self.create_namespace_if_not_exists(namespace)
-                        for obj in objects:
-                            self.k8s_object_applier.apply_object(obj)
-                    except Exception as e:
-                        self.log(f"[ERROR] Failed to apply objects in namespace {namespace}: {e}")
-
-                # Scale workload objects
-                for workload_action in entry.get('workload_actions', []):
-                    action = workload_action["action"]
-                    if action == "set-usage":
-                        self.set_workload_usage(workload_action)
-                    elif action == "scale" and not self.hpa:
-                        self.scale_workload(workload_action)
-
-                # Delete workload objects
-                for delete_info in entry.get('deleted_objects', []):
-                    try:
-                        name = delete_info.get('name', '<unknown>')
-                        namespace = delete_info.get('namespace', '<unknown>')
-                        kind = delete_info.get('kind', '<unknown>')
-
-                        self.k8s_object_applier.delete_object(delete_info)
-                    except Exception as e:
-                        self.log(f"[ERROR] Failed to delete {kind} {name} in namespace {namespace}: {e}")
-
-        # The last timestamp in the trace does not matter (it represents the tear down phase),
-        # so we can just sleep for 15 seconds.
-        time.sleep(15)
+    @staticmethod
+    def unsupported_action(kind):
+        raise ValueError(f"Unsupported workload action: {kind}")
 
     def tear_down(self):
         self.usage_queue.put("STOP")
@@ -246,23 +241,15 @@ class WorkloadManager:
         return sum(1 for pod in pods.items if pod.metadata.namespace in namespaces)
     
     def set_workload_usage(self, usage_info):
-        try:
-            self.usage_queue.put(usage_info)
-        except Exception as e:
-            self.log(f"[ERROR] Failed to send usage event: {e}")
-    
-    def scale_workload(self, scale_info):
-        try:
-            name = scale_info['name']
-            namespace = scale_info['namespace']
-            replicas = scale_info['pods']
-            kind = scale_info['kind']
+        self.usage_queue.put(usage_info)
 
-            if kind == "deployment":
-                self.k8s_api.patch_namespaced_deployment_scale(name, namespace, {"spec": {"replicas": replicas}})
-            elif kind == "statefulset":
-                # For now, we assume that scaling statefulsets is similar to deployments.
-                self.k8s_api.patch_namespaced_deployment_scale(name, namespace, {"spec": {"replicas": replicas}})
-                self.log(f"[INFO] Scaled {kind} {name} to {replicas} replicas in namespace {namespace}")
-        except Exception as e:
-            self.log(f"[ERROR] Failed to scale {kind} {name} in namespace {namespace}: {e}")
+    def scale_workload(self, scale_info):
+        name = scale_info['name']
+        namespace = scale_info['namespace']
+        replicas = scale_info['pods']
+        kind = scale_info['kind'].lower()
+        if kind in {"deployment", "statefulset"}:
+            self.k8s_api.patch_namespaced_deployment_scale(
+                name, namespace, {"spec": {"replicas": replicas}})
+        else:
+            raise ValueError(f"Unsupported scale kind: {kind}")

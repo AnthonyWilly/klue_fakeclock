@@ -29,9 +29,10 @@ class UsageManager(multiprocessing.Process):
     CRU_VERSION = "v1alpha1"
     CRU_PLURAL = "clusterresourceusages"
 
-    def __init__(self, queue):
+    def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS):
         super().__init__()
         self.queue = queue
+        self.reconcile_interval_seconds = reconcile_interval_seconds
 
         # (namespace, workload_name) -> {
         #   (namespace, real_pod_name): {"cpu": float, "memory": float}
@@ -69,7 +70,7 @@ class UsageManager(multiprocessing.Process):
 
         while True:
             try:
-                event = self.queue.get(timeout=self.RECONCILE_INTERVAL_SECONDS)
+                event = self.queue.get(timeout=self.reconcile_interval_seconds)
 
                 self.log(f"Event received: {event}")
 

@@ -7,6 +7,7 @@ nodeclaims, and other resources, while also handling custom logic for scaling an
 import subprocess
 import time
 from datetime import datetime
+from experiment_clock import ExperimentClock, validate_speed_factor
 from pods_mapping import PodsMapping
 from collector import Collector
 from workload.manager import WorkloadManager
@@ -24,15 +25,17 @@ class Manager:
         data_path (string): The path of the JSON with the objects that will be applied by broker.
     """
 
-    def __init__(self, data_path='/tmp', karpenter=True, infrastructure=None, workload=None, hpa=True):
+    def __init__(self, data_path='/tmp', karpenter=True, infrastructure=None, workload=None, hpa=True, speed_factor=1):
         """
         Initializes the Manager class.
         """
+        self.speed_factor = validate_speed_factor(speed_factor, karpenter=karpenter, hpa=hpa)
+        self.clock = ExperimentClock(self.speed_factor)
         self.infrastructure = infrastructure
         self.workload = workload
 
-        self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure)
-        self.workload_manager = WorkloadManager(f"{data_path}/workload_description.json", workload, hpa)
+        self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure, speed_factor=self.speed_factor)
+        self.workload_manager = WorkloadManager(f"{data_path}/workload_description.json", workload, hpa, speed_factor=self.speed_factor)
 
         self.pods_mapping = PodsMapping(karpenter)
         self.collector = Collector(step=30)
@@ -122,19 +125,22 @@ class Manager:
             self.infrastructure_manager.before_emulation()
 
             self.log("[INFO] Starting emulation.")
-            start = datetime.now()
+            subprocess.run(["bash", "src/port-forward.sh"], check=True)
+            self.clock.start()
 
             # 1. Criar as threads para os métodos de emulação
             infra_emulation_thread = threading.Thread(
                 target=self.infrastructure_manager.emulation,
+                args=(self.clock,),
                 name="InfraEmulationThread"
             )
             workload_emulation_thread = threading.Thread(
                 target=self.workload_manager.emulation,
+                args=(self.clock,),
                 name="WorkloadEmulationThread"
             )
 
-            start_time = int(datetime.now().timestamp())
+            start_time = int(self.clock.origin_unix)
             self.stop_collection = False
 
             collector_thread = threading.Thread(
@@ -145,8 +151,6 @@ class Manager:
 
             self.log("[INFO] Starting collector thread")
             collector_thread.start()
-            duration = int((datetime.now() - start).total_seconds() + 15)
-            subprocess.run(["bash", "src/port-forward.sh"], check=True)
 
             self.log("[INFO] Starting emulation thread for InfrastructureManager.")
             infra_emulation_thread.start()

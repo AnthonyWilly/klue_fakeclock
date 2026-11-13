@@ -27,6 +27,8 @@ class KubernetesObjectApplier:
             if e.status == 404:
                 self.k8s_api.create_namespaced_deployment(namespace, obj)
                 self.log(f"[INFO] Deployment {name} created in namespace {namespace}.")
+            else:
+                raise
 
     def apply_hpa(self, obj, namespace, name):
         """
@@ -40,7 +42,9 @@ class KubernetesObjectApplier:
             if e.status == 404:
                 self.k8s_api.create_namespaced_horizontal_pod_autoscaler(namespace, obj)
                 self.log(f"[INFO] HorizontalPodAutoscaler {name} created in namespace {namespace}.")
-            
+            else:
+                raise
+
     def apply_nodeclaim(self, obj, name):
         """
         Aplica um objeto do tipo NodeClaim ao cluster.
@@ -54,6 +58,8 @@ class KubernetesObjectApplier:
                 obj["metadata"].pop("resourceVersion", None)
                 self.k8s_api.create_infrastructure_object(obj, "karpenter.sh", "v1", "nodeclaims")
                 self.log(f"[INFO] Nodeclaim {name} created")
+            else:
+                raise
 
     def apply_node(self, obj, name):
         """
@@ -73,6 +79,8 @@ class KubernetesObjectApplier:
                 obj["metadata"].pop("resourceVersion", None)
                 self.k8s_api.create_infrastructure_object(obj)
                 self.log(f"[INFO] Node {name} created")
+            else:
+                raise
 
     def apply_service_monitor(self, obj, name):
         """
@@ -111,7 +119,7 @@ class KubernetesObjectApplier:
         elif kind == "node":
             self.apply_node(obj, name)
         else:
-            self.log(f"[ERROR] Unsupported kind: {kind}")
+            raise ValueError(f"Unsupported kind: {kind}")
 
     def delete_object(self, delete_info):
         """
@@ -131,4 +139,4 @@ class KubernetesObjectApplier:
             self.k8s_api.delete_namespaced_stateful_set(name, namespace)
             self.log(f"[INFO] StatefulSet {name} deleted in namespace {namespace}.")
         else:
-            self.log(f"[ERROR] Unsupported kind for deletion: {kind}")
+            raise ValueError(f"Unsupported kind for deletion: {kind}")
