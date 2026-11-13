@@ -1,5 +1,6 @@
 import copy
 import json
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -30,7 +31,10 @@ def manager(cls, entries, factor=1, phase='dynamic'):
     result.k8s_object_applier = Mock()
     result.hpa = False
     result.create_namespace_if_not_exists = Mock()
+    result.usage_lock = threading.RLock()
     result.usage_queue = Mock()
+    result.check_usage = Mock()
+    result.usage_progress = dict(enqueued=0, pending=0)
     return result
 
 
@@ -180,7 +184,7 @@ def test_applier_propagates_non_404_failure(kind):
         applier.apply_object({'kind': kind, 'metadata': {'name': 'x'}})
 
 
-def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch):
+def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch, tmp_path):
     import manager as coordinator
     from experiment_clock import ExperimentClock
     time = FakeTime()
@@ -189,6 +193,11 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
     components = {}
     def component(name):
         obj = Mock()
+        obj.data = {'emulation': []}
+        obj.usage_progress = dict(enqueued=0, completed=0, failed=0, pending=0, errors=[],
+            late_events=0, total_lag_real=0, total_lag_logical=0)
+        obj.warnings = []
+        obj.replay_diagnostics = ReplayDiagnostics(0)
         def prepare():
             assert clock.origin_monotonic is None
             time.wait(3)
@@ -203,18 +212,27 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
         assert clock.origin_monotonic is None
         commands.append(args)
         time.wait(4)
+    monkeypatch.setattr(coordinator.subprocess, 'check_output', lambda *a, **k: 'revision')
     monkeypatch.setattr(coordinator.subprocess, 'run', command)
     class Thread:
-        def __init__(self, target, name, args=()):
+        def __init__(self, target, name, args=(), **kwargs):
             self.target, self.name, self.args = target, name, args
         def start(self):
             if self.name != 'CollectorThread':
                 assert clock.origin_monotonic == time.now
                 self.target(*self.args)
-        def join(self):
+        def join(self, **kwargs):
             pass
+        def is_alive(self):
+            return False
     monkeypatch.setattr(coordinator.threading, 'Thread', Thread)
-    instance = coordinator.Manager(karpenter=False, hpa=False, speed_factor=2)
+    from run_report import RunReport
+    report = RunReport(tmp_path / 'out', monotonic=time.monotonic)
+    for name in ('infrastructure_description.json', 'workload_description.json', 'pods_allocation.csv'):
+        (tmp_path / name).write_text('{}')
+    coordinator.PodsMapping.PODS_ALLOCATION_PATH = str(tmp_path / 'pods_allocation.csv')
+    instance = coordinator.Manager(data_path=tmp_path, karpenter=False, hpa=False, speed_factor=2, report=report)
+    instance.collection_diagnostics['complete'] = True
     def prepare_observability():
         assert clock.origin_monotonic is None
         time.wait(2)

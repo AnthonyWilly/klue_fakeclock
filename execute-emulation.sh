@@ -1,16 +1,11 @@
 #!/bin/bash
 
-LOG_FILE="/tmp/emulation.log"
-
-# Clear log at start
-: > "$LOG_FILE"
-
-# Redirect ALL output (stdout + stderr) to the log file
-exec > >(tee -a "$LOG_FILE") 2>&1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPORT_HELPER="$SCRIPT_DIR/src/run_report.py"
 
 # Função para exibir a ajuda
 usage() {
-    echo "Uso: $0 [--dev | --sim] [--use-cluster CONTEXT] [--data-path PATH] [--nodepool-path PATH] [--use-karpenter] [--use-hpa] [--skip-tracer] [--static-infra] [--static-workload] [--speed-factor F] [--kwok-workers-config PATH] [-h | --help]"
+    echo "Uso: $0 [--dev | --sim] [--use-cluster CONTEXT] [--data-path PATH] [--nodepool-path PATH] [--use-karpenter] [--use-hpa] [--skip-tracer] [--static-infra] [--static-workload] [--speed-factor F] [--kwok-workers-config PATH] [--output-dir PATH] [-h | --help]"
     echo ""
     echo "Opções:"
     echo "  --dev                 Criar ambiente de desenvolvimento"
@@ -23,6 +18,7 @@ usage() {
     echo "  --skip-tracer         Pular a execução do tracer"
     echo "  --static-infra        Usar infraestrutura estática na emulação"
     echo "  --static-workload     Usar workload estático na emulação"
+    echo "  --output-dir PATH     Diretório exclusivo para CSVs, log e run.json"
     echo "  --kwok-workers-config PATH Overrides opcionais de paralelismo KWOK"
     echo "  --speed-factor F      Fator finito >= 1 (padrão 1; aceleração sem HPA/Karpenter)"
     echo "  -h, --help            Exibir esta mensagem de ajuda"
@@ -49,9 +45,18 @@ WORKLOAD="dynamic"
 HPA="hpa-off"
 SPEED_FACTOR="1"
 KWOK_WORKERS_CONFIG=""
+OUTPUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --output-dir)
+            if [[ $# -lt 2 || $2 == --* ]]; then
+                echo "Erro: --output-dir requer um caminho."
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
         --kwok-workers-config)
             if [[ $# -lt 2 || $2 == --* ]]; then
                 echo "Erro: --kwok-workers-config requer um caminho."
@@ -119,6 +124,45 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Establish one output identity before validation/setup. Python owns it until
+# returning to EXIT; shell never writes while the coordinator is running.
+output_args=()
+[[ -n $OUTPUT_DIR ]] && output_args=(--output-dir "$OUTPUT_DIR")
+OUTPUT_DIR=$(python3 "$REPORT_HELPER" init "${output_args[@]}" --mode "$ENVIRONMENT" \
+    --speed-factor="$SPEED_FACTOR" --infrastructure "$INFRASTRUCTURE" --workload "$WORKLOAD" \
+    --karpenter "$KARPENTER" --hpa "$HPA") || exit $?
+export KLUE_RUN_ID
+KLUE_RUN_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$OUTPUT_DIR/run.json") || exit $?
+finish_report() {
+    local code=$?
+    trap - EXIT INT TERM
+    python3 "$REPORT_HELPER" finish --output-dir "$OUTPUT_DIR" --exit-code "$code"
+    exit "$code"
+}
+trap finish_report EXIT
+ACTIVE_PID=""
+handle_signal() {
+    local signal=$1 code=$2
+    trap '' INT TERM
+    if [[ -n $ACTIVE_PID ]]; then
+        kill -s "$signal" "$ACTIVE_PID" 2>/dev/null || true
+        wait "$ACTIVE_PID" || true
+    fi
+    exit "$code"
+}
+run_step() {
+    "$@" <&0 &
+    ACTIVE_PID=$!
+    wait "$ACTIVE_PID"
+    local code=$?
+    ACTIVE_PID=""
+    return "$code"
+}
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+LOG_FILE="$OUTPUT_DIR/emulation.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 # Validação das flags
 if [[ -z $ENVIRONMENT ]]; then
     echo "Erro: É necessário especificar --dev ou --sim."
@@ -157,15 +201,20 @@ fi
 export KLUE_SPEED_FACTOR="$SPEED_FACTOR"
 export KLUE_KWOK_WORKERS_CONFIG="$KWOK_WORKERS_CONFIG"
 
+python3 "$REPORT_HELPER" stage --output-dir "$OUTPUT_DIR" --stage setup --workers-config "$KWOK_WORKERS_CONFIG" || exit $?
+if [[ $CLUSTER_ACTION == "use" ]]; then
+    use_existing_cluster "$CLUSTER_CONTEXT" || exit $?
+fi
+
 # Configuração do ambiente
 if [[ $ENVIRONMENT == "development" ]]; then
     echo "Configurando ambiente de desenvolvimento..."
-    cd kwok-karpenter-install
-    ./setup.sh "$KARPENTER" || exit $?
+    cd "$SCRIPT_DIR/kwok-karpenter-install" || exit $?
+    run_step ./setup.sh "$KARPENTER" || exit $?
 elif [[ $ENVIRONMENT == "emulation" ]]; then
     echo "Configurando ambiente de emulação..."
-    cd kwok-karpenter-install
-    ./setup.sh "$KARPENTER" || exit $?
+    cd "$SCRIPT_DIR/kwok-karpenter-install" || exit $?
+    run_step ./setup.sh "$KARPENTER" || exit $?
     cd ..
-    python3 -u src/main.py "$TRACE_PATH" "$NODEPOOL_PATH" "$KARPENTER" "$TRACER" "$INFRASTRUCTURE" "$WORKLOAD" "$HPA" "${workers_args[@]}" --speed-factor="$SPEED_FACTOR"
+    run_step python3 -u src/main.py "$TRACE_PATH" "$NODEPOOL_PATH" "$KARPENTER" "$TRACER" "$INFRASTRUCTURE" "$WORKLOAD" "$HPA" "${workers_args[@]}" --speed-factor="$SPEED_FACTOR" --output-dir "$OUTPUT_DIR"
 fi

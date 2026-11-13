@@ -43,7 +43,7 @@ def test_ksm_overlay_preserves_self_endpoint_authentication_and_input():
 def test_continuous_queue_does_not_starve_periodic_reconciliation():
     now = [100.0]
     seen, ticks = [], []
-    events = iter(range(12))
+    events = iter({'id': index} for index in range(12))
     queue = Mock()
     def get(timeout):
         event = next(events, 'STOP')
@@ -54,7 +54,7 @@ def test_continuous_queue_does_not_starve_periodic_reconciliation():
     usage.handle_set_usage_event = lambda event: seen.append(event)
     usage.reconcile_tracked_workloads = lambda: ticks.append(now[0])
     usage.process_events(lambda: now[0])
-    assert seen == list(range(12))
+    assert seen == [{'id': index} for index in range(12)]
     assert ticks == pytest.approx([101.2, 102, 103.2, 104])
     assert all(0 <= call.kwargs['timeout'] <= 1 for call in queue.get.call_args_list)
 

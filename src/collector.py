@@ -57,6 +57,7 @@ class Collector:
         self.step = round(self.step, 3)
         self.metrics_file = metrics_file
         self.errors = []
+        self.warnings = set()
         self._last_written = {}
         self.effective_intervals = {}
 
@@ -209,6 +210,9 @@ class Collector:
         """Commit a batch only after all queries and mandatory grid checks succeed."""
         try:
             batches = {metric: self.request_metrics(metric, start_time, end_time) for metric in self.read_metrics()}
+            for metric, results in batches.items():
+                if not results and metric not in REQUIRED_METRICS | MEMORY_METRICS:
+                    self.warnings.add(f'optional metric absent: {metric}')
             cursor = CollectionCursor(start_time, self.step)
             window = cursor.window(end_time, max_points=11000)
             expected = {round(cursor.timestamp(index), 3) for index in range(window[2] + 1)}
@@ -230,7 +234,7 @@ class Collector:
             self.errors.append(dict(start=start_time, end=end_time, error=str(error)))
             raise CollectionError(f'collection {start_time}..{end_time}: {error}') from error
 
-    def archive(self, output_dir):
+    def archive(self, output_dir, finalize=None):
         """
         Compresses the CSV files in `output_dir` into `<output_dir>.zip`.
 
@@ -240,7 +244,8 @@ class Collector:
         not compress at all.
         """
         csv_files = sorted(glob.glob(f"{output_dir}/*.csv"))
-        if not csv_files:
+        report_path = os.path.join(output_dir, 'run.json')
+        if not csv_files and not os.path.isfile(report_path):
             self.log(f"[INFO] No CSV files in {output_dir}; skipping archive.")
             return
 
@@ -248,5 +253,9 @@ class Collector:
                              compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for file in csv_files:
                 zf.write(file, arcname=os.path.basename(file))
+            if finalize is not None:
+                finalize()
+            if os.path.isfile(report_path):
+                zf.write(report_path, arcname='run.json')
 
         self.log(f"[INFO] CSV files zipped to {output_dir}.zip")

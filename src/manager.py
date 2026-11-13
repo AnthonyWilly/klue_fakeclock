@@ -6,7 +6,9 @@ nodeclaims, and other resources, while also handling custom logic for scaling an
 
 import subprocess
 import time
-from datetime import datetime
+from run_report import RunReport
+from pathlib import Path
+import queue
 from experiment_clock import ExperimentClock, validate_speed_factor
 from pods_mapping import PodsMapping
 from collector import Collector, CollectionCursor, CollectionError
@@ -28,27 +30,39 @@ class Manager:
         data_path (string): The path of the JSON with the objects that will be applied by broker.
     """
 
-    def __init__(self, data_path='/tmp', karpenter=True, infrastructure=None, workload=None, hpa=True, speed_factor=1, kwok_workers_config=None):
+    def __init__(self, data_path='/tmp', karpenter=True, infrastructure=None, workload=None, hpa=True, speed_factor=1, kwok_workers_config=None, output_dir=None, report=None):
         """
         Initializes the Manager class.
         """
+        self.report = report or RunReport(output_dir)
+        self.output_dir = str(self.report.output_dir)
         self.speed_factor = validate_speed_factor(speed_factor, karpenter=karpenter, hpa=hpa)
         self.intervals = SamplingIntervals(self.speed_factor)
         self.workers_override = read_workers(kwok_workers_config)
         self.clock = ExperimentClock(self.speed_factor)
+        self.clock.cancel = threading.Event()
+        self.clock.defer_tail = True
         self.collection_stop = threading.Event()
         self.collection_error = None
-        self.collection_diagnostics = dict(complete=False, errors=[], requested_intervals=self.intervals.snapshot())
+        self.collection_diagnostics = dict(complete=False, errors=[], error_count=0, requested_intervals=self.intervals.snapshot())
         self.observability = {}
         self.infrastructure = infrastructure
         self.workload = workload
 
+        self.report.update(configuration=dict(self.report.data['configuration'], karpenter=karpenter, hpa=hpa,
+            infrastructure=infrastructure, workload=workload, speed_factor=self.speed_factor,
+            requested_intervals=self.intervals.snapshot(), requested_workers=self.workers_override))
+        for name in ('infrastructure_description.json', 'workload_description.json'):
+            self.report.trace(Path(data_path) / name, 'replay')
         self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure, speed_factor=self.speed_factor)
         self.workload_manager = WorkloadManager(f"{data_path}/workload_description.json", workload, hpa, speed_factor=self.speed_factor)
 
+        self.report.trace(PodsMapping.PODS_ALLOCATION_PATH, 'allocation')
         self.pods_mapping = PodsMapping(karpenter)
         self.collector = Collector(step=self.intervals.query, intervals=self.intervals)
         self.service_monitor_manager = ServiceMonitorManager(interval_seconds=self.intervals.kwok)
+        self.service_monitor_manager.issue_handler = lambda error, **context: self.report.issue(
+            error, component='service_monitor', **context)
 
     def log(self, message):
         """
@@ -95,8 +109,6 @@ class Manager:
         """Export confirmed grid points; stop wakes immediately and flushes the tail."""
         cursor = CollectionCursor(start_time, self.intervals.query)
         self.collection_cursor = cursor
-        run_id = datetime.now().strftime("%Y-%m-%d-%H:%M:%S.%f")
-        self.output_dir = f"output_csv_{run_id}"
         deadline = None
         try:
             while True:
@@ -119,7 +131,10 @@ class Manager:
                         self.collection_diagnostics['complete'] = True
                         break
                 except (CollectionError, ValueError, KeyError, TypeError) as error:
-                    self.collection_diagnostics['errors'].append(str(error))
+                    self.collection_diagnostics['error_count'] = self.collection_diagnostics.get('error_count', 0) + 1
+                    if len(self.collection_diagnostics['errors']) < 100:
+                        self.collection_diagnostics['errors'].append(str(error))
+                    self.log(f'[COLLECTION RETRY] {error}')
                 if stopping:
                     if time.monotonic() >= deadline:
                         raise CollectionError('final sampling incomplete after real ingestion timeout')
@@ -127,99 +142,197 @@ class Manager:
                     time.sleep(1)
         except Exception as error:
             self.collection_error = error
+            self.collection_diagnostics['error_count'] = self.collection_diagnostics.get('error_count', 0) + 1
             self.collection_diagnostics['errors'].append(str(error))
-        finally:
-            try:
-                self.collector.archive(self.output_dir)
-            except Exception as error:
-                self.collection_error = error
-                self.collection_diagnostics['errors'].append(str(error))
+
+    def snapshot(self, final=True):
+        progress, lag = {}, {}
+        for name, manager in (('infrastructure', self.infrastructure_manager),
+                              ('workload', self.workload_manager)):
+            data = manager.replay_diagnostics.snapshot()
+            actions = data.pop('actions')
+            progress[name] = {key: value for key, value in data.items()
+                              if 'lag' not in key and key not in ('late_events', 'worst_event')}
+            lag[name] = {key: value for key, value in data.items()
+                         if 'lag' in key or key in ('late_events', 'worst_event')}
+            count = data['processed_entries']
+            lag[name]['mean_lag_real'] = data['total_lag_real'] / count if count else 0
+            lag[name]['mean_lag_logical'] = data['total_lag_logical'] / count if count else 0
+            for action in actions if final else ():
+                if not action['completed']:
+                    self.report.issue(action['error'], stage='replay', component=name,
+                                      action=action['context'], trace_timestamp=action['trace_timestamp'])
+            if final and data['late_events']:
+                self.report.issue(f"{data['late_events']} late entries; input order preserved",
+                                  warning=True, stage='replay', component=name)
+        usage = dict(self.workload_manager.usage_progress)
+        usage_errors = usage.pop('errors')
+        for error in usage_errors if final else ():
+            context = {key: value for key, value in error.items() if key not in ('kind', 'message', 'completed')}
+            self.report.issue(error.get('message', 'usage reconciliation failed'),
+                              component='usage', stage='replay', **context)
+        if final and usage['late_events']:
+            self.report.issue(f"{usage['late_events']} late usage reconciliations",
+                              warning=True, component='usage', stage='replay')
+        count = usage['completed']
+        usage['mean_lag_real'] = usage['total_lag_real'] / count if count else 0
+        usage['mean_lag_logical'] = usage['total_lag_logical'] / count if count else 0
+        lag['usage'] = {key: value for key, value in usage.items()
+                        if 'lag' in key or key in ('worst_event', 'late_events')}
+        progress['usage'] = {key: value for key, value in usage.items() if key not in lag['usage']}
+        if self.clock.origin_monotonic is not None and not final:
+            self.report.timing(progress_logical=max(
+                progress[name]['final_timestamp'] or 0 for name in ('infrastructure', 'workload')))
+        self.report.update(progress=progress, lag=lag, collection=self.collection_diagnostics,
+                           observability=self.observability)
+        for error in self.collection_diagnostics['errors'] if final else ():
+            self.report.issue(error, warning=self.collection_error is None,
+                              stage='collection', component='collector')
+        for warning in getattr(self.collector, 'warnings', []) if final else ():
+            self.report.issue(warning, warning=True, stage='collection', component='collector')
 
     def run(self):
-        """
-        Executes the main workflow of the Broker.
-
-        This method orchestrates the entire lifecycle of the Broker's operation.
-        """
-        self.log("[INFO] Starting Broker.")
-
+        """Supervise replays, acknowledge usage, collect the tail, then finalize."""
+        report = self.report
+        threads = []
         collector_thread = None
+        monitor_started = False
+        interrupted = False
+        finalization_start = None
+        replay_end = None
+        thread_errors = queue.Queue()
+        last_snapshot = self.clock.monotonic()
+
+        def guarded(name, function):
+            try:
+                function(self.clock)
+            except BaseException as error:
+                thread_errors.put((name, error))
+                self.clock.cancel.set()
+
+        def check_threads():
+            nonlocal last_snapshot
+            while not thread_errors.empty():
+                name, error = thread_errors.get_nowait()
+                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay')
+            if self.clock.cancel.is_set():
+                raise RuntimeError('replay cancelled after component failure')
+            self.workload_manager.check_usage()
+            now = self.clock.monotonic()
+            if now - last_snapshot >= 1:
+                self.snapshot(final=False)
+                last_snapshot = now
+            if self.collection_error:
+                raise RuntimeError('required collection failed; see collection diagnostics')
 
         try:
-            self.log("[INFO] Preparing to start emulation.")
+            report.stage('preparation')
             self.infrastructure_manager.before_setup()
             self.workload_manager.before_setup()
             self.service_monitor_manager.start()
-
-            self.log("[INFO] Executing setup of infrastructure and workload.")
+            monitor_started = True
             self.infrastructure_manager.setup()
-
             self.workload_manager.setup()
-
             self.start_mapping_and_scheduler()
-
             self.workload_manager.before_emulation()
             self.infrastructure_manager.before_emulation()
-
-            self.log("[INFO] Starting emulation.")
-            subprocess.run(["bash", "src/port-forward.sh"], check=True)
+            subprocess.run(['bash', 'src/port-forward.sh'], check=True)
             self.prepare_observability()
+            self.workload_manager.check_usage()
             self.clock.start()
-
-            # 1. Criar as threads para os métodos de emulação
-            infra_emulation_thread = threading.Thread(
-                target=self.infrastructure_manager.emulation,
-                args=(self.clock,),
-                name="InfraEmulationThread"
-            )
-            workload_emulation_thread = threading.Thread(
-                target=self.workload_manager.emulation,
-                args=(self.clock,),
-                name="WorkloadEmulationThread"
-            )
-
-            start_time = self.clock.origin_unix
+            scheduled = max((entry['timestamp'] for manager in
+                (self.infrastructure_manager, self.workload_manager)
+                for entry in manager.data['emulation']), default=0)
+            report.timing(preparation_real=self.clock.origin_monotonic - report.data['timing']['started_monotonic'],
+                          origin_unix=self.clock.origin_unix, origin_monotonic=self.clock.origin_monotonic,
+                          scheduled_logical=scheduled)
+            report.stage('replay')
             self.collection_stop.clear()
-
-            collector_thread = threading.Thread(
-                target=self.collect_loop,
-                args=(start_time,),
-                name="CollectorThread"
-            )
-
-            self.log("[INFO] Starting collector thread")
+            collector_thread = threading.Thread(target=guarded,
+                args=('collector', lambda clock: self.collect_loop(clock.origin_unix)),
+                name='CollectorThread', daemon=True)
             collector_thread.start()
-
-            self.log("[INFO] Starting emulation thread for InfrastructureManager.")
-            infra_emulation_thread.start()
-            self.log("[INFO] Starting emulation thread for WorkloadManager.")
-            workload_emulation_thread.start()
-        
-            infra_emulation_thread.join()
-            self.log("[INFO] InfrastructureManager emulation thread completed.")
-            workload_emulation_thread.join()
-            self.log("[INFO] WorkloadManager emulation thread completed.")
-
+            for name, manager in (('infrastructure', self.infrastructure_manager),
+                                  ('workload', self.workload_manager)):
+                thread = threading.Thread(target=guarded, args=(name, manager.emulation),
+                                          name=name, daemon=True)
+                thread.start()
+                threads.append(thread)
+            while any(thread.is_alive() for thread in threads):
+                for thread in threads:
+                    thread.join(.1)
+                check_threads()
+            check_threads()
+            # STOP is FIFO: completion requires acknowledgements, not queue.put.
+            self.workload_manager.finish_usage()
+            replay_end = self.clock.monotonic()
+            complete = (not self.workload_manager.usage_progress['failed']
+                        and not self.workload_manager.usage_progress['errors']
+                        and all(not manager.replay_diagnostics.snapshot()['failed_actions']
+                                for manager in (self.infrastructure_manager, self.workload_manager)))
+            report.timing(replay_real=replay_end - self.clock.origin_monotonic,
+                          progress_logical=scheduled, replay_complete=complete,
+                          effective_factor=(scheduled / (replay_end - self.clock.origin_monotonic)
+                                            if complete and replay_end > self.clock.origin_monotonic else None))
+            finalization_start = replay_end
+            report.stage('collection')
+            tail_start = self.clock.monotonic()
+            self.clock.tail()
+            report.timing(tail_real=self.clock.monotonic() - tail_start)
+        except BaseException as error:
+            interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
+            report.issue(error, component='coordinator')
         finally:
+            self.clock.cancel.set()
+            for thread in threads:
+                thread.join(timeout=1)
+                if thread.is_alive():
+                    report.issue('thread did not stop within real cleanup deadline', component=thread.name)
+            # Preserve any primary thread exception even if cancellation won the race.
+            while not thread_errors.empty():
+                name, error = thread_errors.get_nowait()
+                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay')
+            now = self.clock.monotonic()
+            if finalization_start is None:
+                finalization_start = now
+            if self.clock.origin_monotonic is not None and replay_end is None:
+                timestamps = [manager.replay_diagnostics.snapshot()['final_timestamp'] or 0
+                              for manager in (self.infrastructure_manager, self.workload_manager)]
+                report.timing(replay_real=now - self.clock.origin_monotonic,
+                              progress_logical=max(timestamps), effective_factor=None)
+            elif self.clock.origin_monotonic is None:
+                report.timing(preparation_real=now - report.data['timing']['started_monotonic'])
             self.collection_end = time.time()
             self.collection_stop.set()
-
             if collector_thread:
-                collector_thread.join()
-                self.log("[INFO] Collector thread stopped.")
-    
-            self.service_monitor_manager.stop()
-
-            self.log("[INFO] Emulation completed. Tearing down infrastructure, workload and temp files.")
-
+                collector_thread.join(timeout=65)
+                if collector_thread.is_alive():
+                    report.issue('collection did not stop within real ingestion deadline',
+                                 component='collector', stage='collection')
+                elif not self.collection_diagnostics['complete'] and not self.collection_error:
+                    report.issue('required collection incomplete', component='collector', stage='collection')
+            report.stage('teardown')
+            cleanups = [('workload', self.workload_manager.tear_down),
+                        ('infrastructure', self.infrastructure_manager.tear_down)]
+            if monitor_started:
+                cleanups.append(('service_monitor', self.service_monitor_manager.stop))
+            for name, cleanup in cleanups:
+                try:
+                    cleanup()
+                except BaseException as error:
+                    interrupted = interrupted or isinstance(error, (KeyboardInterrupt, SystemExit))
+                    report.issue(error, component=name)
+            self.snapshot()
+            def finalize():
+                report.timing(finalization_real=self.clock.monotonic() - finalization_start)
+                report.finish(interrupted=interrupted)
+            report.stage('archive')
+            finalize()
             try:
-                self.workload_manager.tear_down()
-            except Exception:
-                self.log("[ERROR] Failed to tear down workload. Traceback follows.")
-                self.log(f"[ERROR] Failed to tear down workload: {error}")
-
-            try:
-                self.infrastructure_manager.tear_down()
-            except Exception:
-                self.log("[ERROR] Failed to tear down infrastructure. Traceback follows.")
-                self.log(f"[ERROR] Failed to tear down infrastructure: {error}")
+                self.collector.archive(self.output_dir, finalize=finalize)
+            except BaseException as error:
+                interrupted = interrupted or isinstance(error, (KeyboardInterrupt, SystemExit))
+                report.issue(error, component='archive', stage='archive')
+                finalize()
+        if report.data['status'] in ('failed', 'interrupted'):
+            raise RuntimeError(f"emulation {report.data['status']}; see {report.path}")

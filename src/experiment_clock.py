@@ -65,7 +65,15 @@ class ExperimentClock:
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 return
-            self.wait(remaining)
+            cancel = getattr(self, 'cancel', None)
+            if cancel is None:
+                self.wait(remaining)
+            elif cancel.is_set():
+                raise InterruptedError('replay cancelled')
+            elif self.wait is not time.sleep:
+                self.wait(remaining)
+            elif cancel.wait(remaining):
+                raise InterruptedError('replay cancelled')
 
     def tail(self, logical_seconds=15):
         self.wait_until(self.monotonic() + self.real_duration(logical_seconds))
@@ -113,9 +121,17 @@ class ReplayDiagnostics:
             self._data['not_applicable_actions'] += 1
 
     def apply(self, clock, scheduled, context, action, *args):
+        if getattr(clock, 'cancel', None) is not None and clock.cancel.is_set():
+            raise InterruptedError('replay cancelled')
         started = clock.monotonic()
         lag = max(0, started - scheduled)
-        record = dict(context=copy.deepcopy(context), scheduled=scheduled, started=started,
+        context = copy.deepcopy(context)
+        obj = context.pop('object', None)
+        if obj:
+            metadata = obj.get('metadata', {})
+            context.update(kind=obj.get('kind'), name=metadata.get('name', obj.get('name')),
+                           namespace=metadata.get('namespace', obj.get('namespace')))
+        record = dict(context=context, scheduled=scheduled, started=started,
                       trace_timestamp=(scheduled - clock.origin_monotonic) * clock.speed_factor,
                       lag_real=lag, lag_logical=lag * clock.speed_factor)
         with self._lock:
@@ -130,6 +146,7 @@ class ReplayDiagnostics:
         with self._lock:
             self._data['completed_actions' if record['completed'] else 'failed_actions'] += 1
             self._data['actions'].append(record)
+        print(f"[REPLAY ACTION] {record}", flush=True)
         return record
 
 
@@ -144,7 +161,8 @@ def replay_entries(trace, clock, diagnostics, dynamic):
         diagnostics.entry(index, entry['timestamp'], scheduled,
                           started, clock.speed_factor, dynamic)
     # Tail begins after actual completion of all actions, even when late.
-    clock.tail()
+    if not getattr(clock, 'defer_tail', False):
+        clock.tail()
 
 
 if __name__ == '__main__':

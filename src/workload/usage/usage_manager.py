@@ -31,11 +31,12 @@ class UsageManager(multiprocessing.Process):
     CRU_VERSION = "v1alpha1"
     CRU_PLURAL = "clusterresourceusages"
 
-    def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS):
+    def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS, status_queue=None):
         super().__init__()
         if not math.isfinite(reconcile_interval_seconds) or reconcile_interval_seconds <= 0:
             raise ValueError("reconciliation interval must be positive and finite")
         self.queue = queue
+        self.status_queue = status_queue
         self.reconcile_interval_seconds = reconcile_interval_seconds
 
         # (namespace, workload_name) -> {
@@ -63,15 +64,18 @@ class UsageManager(multiprocessing.Process):
         including when the queue remains continuously occupied.
         """
 
-        self.log("Process started")
+        try:
+            self.k8s_api = K8SAPI(timeout=self.TIME_OUT)
+            self.assignment_engine = UsageAssignmentEngine()
+            self.cru_generator = ClusterResourceUsageGenerator()
+            self.process_events()
+        except BaseException as error:
+            self.emit(kind='fatal', message=str(error))
+            raise
 
-        self.k8s_api = K8SAPI(timeout=self.TIME_OUT)
-        self.assignment_engine = UsageAssignmentEngine()
-        self.cru_generator = ClusterResourceUsageGenerator()
-
-        self.log("K8SAPI initialized")
-
-        self.process_events()
+    def emit(self, **message):
+        if self.status_queue is not None:
+            self.status_queue.put(message)
 
     def process_events(self, monotonic=None):
         """A busy queue cannot starve reconciliation; events retain FIFO order."""
@@ -80,7 +84,10 @@ class UsageManager(multiprocessing.Process):
         while True:
             now = monotonic()
             if now >= deadline:
-                self.reconcile_tracked_workloads()
+                try:
+                    self.reconcile_tracked_workloads()
+                except Exception as error:
+                    self.emit(kind='error', message=str(error), action='periodic-reconciliation')
                 # Skip expired ticks, never shift the periodic grid to event arrival.
                 now = monotonic()
                 deadline += (int((now - deadline) // self.reconcile_interval_seconds) + 1) * self.reconcile_interval_seconds
@@ -90,8 +97,20 @@ class UsageManager(multiprocessing.Process):
                 continue
             if event == "STOP":
                 self.log("Stopping UsageManager")
+                self.emit(kind='stopped')
                 break
-            self.handle_set_usage_event(event)
+            timing = event.get('replay_timing', {})
+            lag = max(0, monotonic() - timing.get('scheduled_monotonic', monotonic()))
+            context = dict(namespace=event.get('namespace'), resource=event.get('name'),
+                           trace_timestamp=timing.get('trace_timestamp'))
+            try:
+                self.handle_set_usage_event(event)
+            except Exception as error:
+                self.emit(kind='ack', completed=False, message=str(error), **context)
+            else:
+                self.emit(kind='ack', completed=True, lag_real=lag,
+                          lag_logical=lag * timing.get('speed_factor', 1), **context)
+            self.log(f'Usage reconciliation lag_real={lag}: {context}')
 
     # --------------------------------------------------
     # Event handling
@@ -278,7 +297,7 @@ class UsageManager(multiprocessing.Process):
                 self.existing_crus.add(cru_name)
 
         except Exception as e:
-            self.log(f"[WARNING] Failed to apply usage for CRU {cru_name}: error={e}")
+            raise RuntimeError(f"Failed to apply usage for CRU {cru_name}: {e}") from e
 
     def delete_cru(self, cru_name):
         """
@@ -299,25 +318,18 @@ class UsageManager(multiprocessing.Process):
             if e.status == 404:  # if 404, then CRU already no longer exists
                 self.existing_crus.discard(cru_name)
             else:
-                self.log(f"[WARNING] Failed to delete CRU {cru_name}: {e}") 
+                raise
 
-
-        except Exception as e:
-            self.log(f"[WARNING] Failed to delete CRU {cru_name}: {e}")
 
     def list_emulated_pod_objects(self, namespace, workload_name):
         """
         Return the exact set of live emulated pods for a workload.
         """
 
-        try:
-            return self.k8s_api.list_namespaced_pod(
-                namespace=namespace,
-                label_selector=f"deployment={workload_name}",
-            )
-        except Exception as e:
-            self.log(f"[WARNING] Failed to list emulated pods for {namespace}/{workload_name}: {e}")
-            return None
+        return self.k8s_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"deployment={workload_name}",
+        )
 
     def deployment_exists(self, namespace, name):
         try:
@@ -331,12 +343,8 @@ class UsageManager(multiprocessing.Process):
             if e.status == 404:
                 return False
             
-            self.log(f"[WARNING] Failed to check deployment {namespace}/{name}: status={e.status}, reason={e.reason}")
-            return None
-    
-        except Exception as e:
-            self.log(f"[WARNING] Failed to check deployment {namespace}/{name}: error={e}")
-            return None
+            raise
+
     # --------------------------------------------------
     # Get emulated pod's useful information
     # --------------------------------------------------

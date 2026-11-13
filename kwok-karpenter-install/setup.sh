@@ -1,3 +1,6 @@
+#!/bin/bash
+set -e -o pipefail
+
 # Validate before any setup command, including direct invocation.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$SCRIPT_DIR/../src/experiment_clock.py" --speed-factor="${KLUE_SPEED_FACTOR:-1}" || exit $?
@@ -8,7 +11,7 @@ fi
 go install github.com/google/ko@latest
 export PATH=$PATH:~/go/bin
 
-source ~/.bashrc
+source ~/.bashrc || true
 # source ~/.zshrc
 
 if [ $# -lt 1 ]; then
@@ -20,7 +23,7 @@ KARPENTER="$1"
 
 # Setup Prometheus and Grafana
 
-kubectl create namespace monitoring
+kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl apply --server-side -f kube-prometheus/manifests/setup
 kubectl wait \

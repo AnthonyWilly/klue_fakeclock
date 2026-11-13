@@ -33,6 +33,11 @@ class ServiceMonitorManager:
     def log(self, message):
         print(f"[SERVICE MONITOR WATCHER] {message}", flush=True)
 
+    def report_issue(self, error, **context):
+        handler = getattr(self, 'issue_handler', None)
+        if handler is not None:
+            handler(error, **context)
+
     def prepare(self):
         """Synchronously configure nodes created during setup before replay readiness."""
         nodes = self.k8s_api.v1.list_node().items
@@ -48,7 +53,9 @@ class ServiceMonitorManager:
     def stop(self):
         self.log("Stopping.")
         self._stop_event.set()
-        self._thread.join()
+        self._thread.join(timeout=65)
+        if self._thread.is_alive():
+            raise RuntimeError("ServiceMonitorWatcher did not stop within real watch deadline")
         self.log("Stopped.")
 
     # ------------------------------------------------------------------
@@ -113,6 +120,7 @@ class ServiceMonitorManager:
                         self.log("[WARNING] Watch resourceVersion expired, relisting nodes.")
                     else:
                         self.log(f"[WARNING] Watch error, reconnecting: {e}")
+                        self.report_issue(e, warning=True, action="watch-reconnect")
                     self._stop_event.wait(1)
 
     # ------------------------------------------------------------------
@@ -130,7 +138,12 @@ class ServiceMonitorManager:
             })
             self.log(f"[INFO] Patched metrics annotation for node {node_name}.")
         except Exception as e:
+            if isinstance(e, ApiException) and e.status == 404 and not strict:
+                return  # Node disappeared between watch delivery and patch.
             self.log(f"[WARNING] Failed to patch annotation for node {node_name}: {e}")
+            if strict:
+                raise
+            self.report_issue(e, action='patch-annotation', resource=node_name)
 
         try:
             service_monitor = self.servicemonitor_generator.generate_service_monitor(node_name)
@@ -140,6 +153,7 @@ class ServiceMonitorManager:
             self.log(f"[ERROR] Failed to create ServiceMonitor for node {node_name}: {e}")
             if strict:
                 raise
+            self.report_issue(e, action='apply-service-monitor', resource=node_name)
 
     def _on_node_deleted(self, node_name: str):
         try:
@@ -148,7 +162,10 @@ class ServiceMonitorManager:
             )
             self.log(f"[INFO] ServiceMonitor deleted for node {node_name}.")
         except Exception as e:
+            if isinstance(e, ApiException) and e.status == 404:
+                return
             self.log(f"[WARNING] Failed to delete ServiceMonitor for node {node_name}: {e}")
+            self.report_issue(e, action='delete-service-monitor', resource=node_name)
 
     # ------------------------------------------------------------------
     # Helpers

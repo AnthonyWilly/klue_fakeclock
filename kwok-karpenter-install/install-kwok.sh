@@ -1,3 +1,6 @@
+#!/bin/bash
+set -e -o pipefail
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n ${KLUE_KWOK_WORKERS_CONFIG:-} ]]; then
     python3 "$SCRIPT_DIR/../src/kwok_config.py" validate --workers-config "$KLUE_KWOK_WORKERS_CONFIG" || exit $?

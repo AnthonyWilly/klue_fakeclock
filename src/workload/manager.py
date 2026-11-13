@@ -9,6 +9,8 @@ from kubernetes import client
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_object_applier import KubernetesObjectApplier
 import multiprocessing
+import queue
+import threading
 from workload.usage.usage_manager import UsageManager
 
 class WorkloadManager:
@@ -33,7 +35,14 @@ class WorkloadManager:
         
         self.replay_diagnostics = ReplayDiagnostics(len(self.data['emulation']))
         self.usage_queue = multiprocessing.Queue()
-        self.usage_manager = UsageManager(self.usage_queue, reconcile_interval_seconds=5 / self.speed_factor)
+        self.usage_lock = threading.RLock()
+        self.usage_status = multiprocessing.Queue()
+        self.usage_manager = UsageManager(self.usage_queue, reconcile_interval_seconds=5 / self.speed_factor,
+                                          status_queue=self.usage_status)
+        self.usage_progress = dict(enqueued=0, completed=0, failed=0, pending=0,
+            stopped=False, errors=[], late_events=0, max_lag_real=0, total_lag_real=0,
+            max_lag_logical=0, total_lag_logical=0, worst_event=None)
+        self.usage_stop_sent = False
 
     def log(self, message):
         """
@@ -155,19 +164,74 @@ class WorkloadManager:
     def unsupported_action(kind):
         raise ValueError(f"Unsupported workload action: {kind}")
 
+    def check_usage(self, stopping=False):
+        with self.usage_lock:
+            self._check_usage(stopping)
+
+    def _check_usage(self, stopping=False):
+        progress = self.usage_progress
+        while True:
+            try:
+                message = self.usage_status.get_nowait()
+            except queue.Empty:
+                break
+            kind = message['kind']
+            if kind == 'ack':
+                progress['completed' if message['completed'] else 'failed'] += 1
+                if not message['completed']:
+                    progress['errors'].append(message)
+                else:
+                    lag = message.get('lag_real', 0)
+                    progress['late_events'] += int(lag > 0)
+                    progress['total_lag_real'] += lag
+                    progress['total_lag_logical'] += message.get('lag_logical', 0)
+                    if lag > progress['max_lag_real']:
+                        progress['max_lag_real'] = lag
+                        progress['max_lag_logical'] = message['lag_logical']
+                        progress['worst_event'] = message
+            elif kind == 'stopped':
+                progress['stopped'] = True
+            else:
+                progress['errors'].append(message)
+            progress['pending'] = progress['enqueued'] - progress['completed'] - progress['failed']
+        if self.usage_manager.pid is not None and self.usage_manager.exitcode is not None:
+            if self.usage_manager.exitcode != 0:
+                raise RuntimeError(f'UsageManager exited with code {self.usage_manager.exitcode}')
+            if not stopping:
+                raise RuntimeError('UsageManager stopped before replay finished')
+
+    def finish_usage(self, timeout=30):
+        if self.usage_manager.pid is None:
+            return
+        if not self.usage_stop_sent:
+            self.usage_queue.put('STOP')
+            self.usage_stop_sent = True
+        deadline = time.monotonic() + timeout
+        while self.usage_manager.is_alive():
+            self.check_usage(stopping=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('UsageManager did not drain within real cleanup deadline')
+            self.usage_manager.join(timeout=min(.1, remaining))
+        self.check_usage(stopping=True)
+        if self.usage_progress['pending'] or not self.usage_progress['stopped']:
+            raise RuntimeError('UsageManager exited without acknowledging all queued events')
+
     def tear_down(self):
-        self.usage_queue.put("STOP")
-        self.usage_manager.join(timeout=30)
-
-        if self.usage_manager.is_alive():
-            self.log("[WARNING] UsageManager did not stop after 30s. Terminating.")
-            self.usage_manager.terminate()
-            self.usage_manager.join(timeout=30)
-
-        if self.usage_manager.is_alive():
-            self.log("[WARNING] UsageManager did not terminate. Killing.")
-            self.usage_manager.kill()
-            self.usage_manager.join(timeout=30)
+        if self.usage_manager.pid is None:
+            return
+        try:
+            self.finish_usage()
+        finally:
+            if self.usage_manager.is_alive():
+                self.usage_manager.terminate()
+                self.usage_manager.join(timeout=5)
+            if self.usage_manager.is_alive():
+                self.usage_manager.kill()
+                self.usage_manager.join(timeout=5)
+            # Never wait for a feeder whose consumer has died.
+            self.usage_queue.cancel_join_thread()
+            self.usage_queue.close()
 
     def wait_pods_ready(self, pods_before_setup: int = 0):
         """
@@ -241,7 +305,11 @@ class WorkloadManager:
         return sum(1 for pod in pods.items if pod.metadata.namespace in namespaces)
     
     def set_workload_usage(self, usage_info):
-        self.usage_queue.put(usage_info)
+        with self.usage_lock:
+            self.check_usage()
+            self.usage_queue.put(usage_info)
+            self.usage_progress['enqueued'] += 1
+            self.usage_progress['pending'] += 1
 
     def scale_workload(self, scale_info):
         name = scale_info['name']

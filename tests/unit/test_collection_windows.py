@@ -149,6 +149,7 @@ def make_coordinator(tmp_path, monkeypatch, end, fail_once=False, confirmed=2000
     from manager import Manager
     import manager as module
     result = Manager.__new__(Manager)
+    result.output_dir = str(tmp_path / 'output_csv_test')
     result.intervals = SamplingIntervals(5)
     result.collector = make_collector(tmp_path)
     fake_queries(result.collector)
@@ -180,7 +181,8 @@ def test_short_run_stop_flushes_origin_without_waiting_collection_cycle(tmp_path
     result.collection_stop.wait.assert_any_call(60)
     rows = list(csv.DictReader(next(tmp_path.glob('output_csv_*/*.csv')).open()))
     assert len(rows) == 1 and rows[0]['timestamp'] == '1000.125'
-    assert list(tmp_path.glob('*.zip'))
+    # Collection leaves archiving to the coordinator after report finalization.
+    assert not list(tmp_path.glob('*.zip'))
 
 
 def test_final_ingestion_timeout_exposes_incomplete_sampling(tmp_path, monkeypatch):

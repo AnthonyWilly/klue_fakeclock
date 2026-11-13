@@ -164,8 +164,42 @@ Final ingestion has a 60-real-second budget, including HTTP requests. The
 coordinator exposes `collection_error`, `collection_diagnostics`, and
 `observability` (requested/effective intervals, installed worker counts and
 KWOK images) for execution diagnostics. CSV files are archived once after
-collection. These checks establish sampling availability, not fidelity of an
+collection and teardown, with the finalized execution report. These checks establish sampling availability, not fidelity of an
 accelerated execution; evaluate that separately on the target machine.
+
+#### Execution results
+
+`--output-dir PATH` selects a new, exclusive directory for raw CSVs,
+`emulation.log` and `run.json`. Existing directories and archives are rejected.
+Without the flag, KLUE creates `output_csv_<run-id>` in the current directory.
+The Python CLI also accepts `--output-dir` as an optional final argument.
+
+The shell creates the report before validation and external setup; Python
+continues the same run identity through tracing, preparation, replay,
+collection and teardown. Updates use atomic replacement. The version 1 report
+contains UTC start/end, Git revision, SHA-256 identities of input files,
+requested/effective sampling and KWOK settings, progress and usage acknowledgements,
+real/logical lag, and bounded error/warning details with total counts.
+Progress snapshots refresh during replay. Full action and lag context remains
+in the execution log; Kubernetes object bodies and kubeconfig are not copied
+into the report.
+
+Statuses are `running`, `completed`, `completed_with_warnings`, `failed`, or
+`interrupted`. Late events preserve input order and produce warnings. Failed
+applications, lost usage acknowledgements, premature worker termination,
+incomplete required collection, teardown and archive errors produce nonzero
+exit status. Missing optional metrics may warn. Cleanup errors retain the
+original failure. A failed archive leaves its error beside the CSVs in
+`run.json`; a successful ZIP includes the finalized report.
+
+Timing separates preparation, replay and finalization, including an explicit
+15-logical-second observation tail after the usage queue drains. The effective
+factor divides scheduled logical duration by real replay duration and excludes
+the tail and preparation/finalization. Incomplete replays have no effective
+factor. Unstarted phases are null. These are operational diagnostics; the
+report makes no fidelity judgment. SIGINT/SIGTERM attempt orderly cleanup;
+SIGKILL, machine loss or unavailable storage may leave the initial `running`
+report without a final result.
 
 #### KWOK worker experiments
 

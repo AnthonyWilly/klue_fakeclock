@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 BASE_ARGS = ['trace', 'nodepool', 'karpenter-off', 'skip-tracer', 'dynamic', 'dynamic', 'hpa-off']
 
 
+@pytest.fixture(autouse=True)
+def isolated_outputs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.mark.parametrize('value', ['nan', 'inf', '-inf', 'oops', '0', '.5', '5001', '1e300'])
 def test_python_cli_rejects_invalid_values_before_actions(monkeypatch, value):
     for name in ('apply_nodepool', 'run_tracer', 'run_manager'):
@@ -66,6 +71,7 @@ def shell_environment(tmp_path):
     (tmp_path / 'kwok-karpenter-install').mkdir()
     script = (ROOT / 'execute-emulation.sh').read_text().replace('/tmp/emulation.log', str(tmp_path / 'emulation.log'))
     (tmp_path / 'execute-emulation.sh').write_text(script)
+    shutil.copyfile(ROOT / 'src/run_report.py', tmp_path / 'src/run_report.py')
     shutil.copyfile(ROOT / 'src/experiment_clock.py', tmp_path / 'src/experiment_clock.py')
     shutil.copyfile(ROOT / 'src/kwok_config.py', tmp_path / 'src/kwok_config.py')
     calls = tmp_path / 'calls'
@@ -78,7 +84,11 @@ import json, os, runpy, sys
 args = sys.argv[1:]
 if args[0] == '-u':
     args.pop(0)
-if args[0].endswith(('experiment_clock.py', 'kwok_config.py')):
+if args[0] == '-c':
+    code = args[1]
+    sys.argv = ['-c', *args[2:]]
+    exec(code, {{'__name__': '__main__'}})
+elif args[0].endswith(('experiment_clock.py', 'kwok_config.py', 'run_report.py')):
     sys.argv = args
     runpy.run_path(args[0], run_name='__main__')
 else:
@@ -118,7 +128,7 @@ def test_shell_passes_valid_speed_factor(shell_environment, factor):
                                      ([] if factor is None else ['--speed-factor', factor]))
     assert result.returncode == 0, result.stdout + result.stderr
     assert calls[0] == 'setup'
-    assert json.loads(calls[1])[-1] == f'--speed-factor={factor or "1"}'
+    assert f'--speed-factor={factor or "1"}' in json.loads(calls[1])
 
 
 @pytest.mark.parametrize('extra', [['--use-hpa'], ['--use-karpenter', '--nodepool-path', 'np'], ['--dev']])
@@ -137,7 +147,7 @@ def test_shell_passes_valid_worker_path_with_spaces(shell_environment, tmp_path)
     assert calls[0] == 'setup'
     arguments = json.loads(calls[1])
     assert arguments[arguments.index('--kwok-workers-config') + 1] == str(path)
-    assert arguments[-1] == '--speed-factor=2'
+    assert '--speed-factor=2' in arguments
 
 
 def test_python_passes_valid_worker_overrides_to_manager(tmp_path, monkeypatch):
