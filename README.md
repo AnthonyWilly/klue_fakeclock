@@ -46,7 +46,7 @@ chmod +x create-cluster.sh
 
 ---
 ## 📂 About the Emulation Input
-Follow [this guide](docs/INPUT_v2.md) to learn how to prepare the input for KLUE. The input can be a trace collected from a real cluster or a trace you generate yourself, as long as it follows the format defined in our tool's documentation.
+Follow [this guide](docs/INPUT.md) to learn how to prepare the input for KLUE. The input can be a trace collected from a real cluster or a trace you generate yourself, as long as it follows the format defined in our tool's documentation.
 
 ## 🚀 Executing the Emulation Tool
 
@@ -60,8 +60,8 @@ chmod +x execute-emulation.sh
 
 There are **2 ways** to execute our emulation tool:
 
-1. Starting from a **trace collected from some infrastructure**, using the collected metrics as input. The required format is described in [docs/INPUT_v2.md](docs/INPUT_v2.md).
-2. **Creating your own input** by generating a time series that represents the workload and infrastructure behavior you want to emulate. The expected format is also described in [docs/INPUT_v2.md](docs/INPUT_v2.md).
+1. Starting from a **trace collected from some infrastructure**, using the collected metrics as input. The required format is described in [docs/INPUT.md](docs/INPUT.md).
+2. **Creating your own input** by generating a time series that represents the workload and infrastructure behavior you want to emulate. The expected format is also described in [docs/INPUT.md](docs/INPUT.md).
 
 After preparing one of these two input types, our emulation tool supports different execution modes by combining the available flags. Below are the main ways to run the tool, with examples for each scenario. You can combine the flags as needed to fit your use case.
 
@@ -85,7 +85,7 @@ If you want to use Karpenter for dynamic node management, you need to provide th
 **OBS:** The `<trace-path>` should not ends with /, you need to provide a path in the format /path/to/trace
 
 #### 3. **Skip Tracer Step**
-Like we said before in [this guide](docs/INPUT_v2.md), you can execute our emulation tool in a lot of scenarious. One of them, is the one which you have one input in the format of our tool. 
+Like we said before in [this guide](docs/INPUT.md), you can execute our emulation tool in a lot of scenarious. One of them, is the one which you have one input in the format of our tool.
 Add `--skip-tracer` to any command to skip the trace generation step:
 ```bash
 ./execute-emulation.sh --sim --use-cluster <cluster-context> --data-path <trace-path> --skip-tracer
@@ -200,6 +200,14 @@ factor. Unstarted phases are null. These are operational diagnostics; the
 report makes no fidelity judgment. SIGINT/SIGTERM attempt orderly cleanup;
 SIGKILL, machine loss or unavailable storage may leave the initial `running`
 report without a final result.
+
+#### Visual comparison
+
+Raw accelerated CSVs use real time. Prepare explicit logical-time views before
+passing them to the R scripts; cumulative CPU needs the matching value
+transformation to preserve cores. See [the evaluation guide](docs/ACCELERATION.md)
+for the preparer, legacy inputs, manual baseline acceptance and controlled
+1×/2×/5× and worker experiments.
 
 #### KWOK worker experiments
 
