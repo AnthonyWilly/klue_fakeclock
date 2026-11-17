@@ -156,7 +156,18 @@ and new labels extend the file schema. Optional Karpenter/VPA metrics may be
 absent. Missing required evaluations, HTTP/JSON/Prometheus errors and stale
 source scrapes are exposed as collection errors. Source samples older than
 one configured scrape interval plus its scrape timeout are rejected rather
-than hidden by Prometheus lookback.
+than hidden by Prometheus lookback. Readiness and historical export resolve
+that interval and timeout from the series' scrape origin (`job`, `instance`,
+and available `endpoint`, `service`, `metrics_path` discriminators), using
+Prometheus' effective target configuration with a 1 ms numerical tolerance.
+Workload labels such as `pod`, `container` and `namespace` do not identify the
+scrape origin. Kubelet/cAdvisor at 30 s/10 s keeps a 40-real-second freshness
+limit at every speed factor; KWOK at 2× retains its 7.5 s/7.5 s limit of 15 s.
+Unknown origins, invalid configuration and conflicting compatible target policies
+fail explicitly. Equivalent targets may share one policy. Optional metrics may
+be absent, but present samples must pass the same validation. Observed policies
+are retained for historical export after target removal; kubelet targets do not
+become prerequisites or contribute to the KWOK/kube-state-metrics watermark.
 
 Stopping wakes collection immediately and flushes every grid point through the
 replay's observation tail, including executions shorter than one batch cycle.

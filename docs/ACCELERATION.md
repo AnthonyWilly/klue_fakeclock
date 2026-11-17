@@ -32,6 +32,20 @@ samples and HTTP errors remain collection errors. `run.json` collection metadata
 includes expected/live node counts and `kwok_targets_not_required`. Autoscaler
 modes retain their existing target policy.
 
+Freshness uses each series' effective Prometheus scrape interval plus timeout,
+with a 1 ms numerical tolerance, both before replay and during historical export.
+The collector matches `job` and `instance`, disambiguating by `endpoint`,
+`service` and `metrics_path` when available on both series and targets. Workload
+labels are excluded from origin matching. Multiple matching targets must agree
+on the policy; unknown origins, invalid policies and conflicts fail explicitly.
+Kubelet/cAdvisor scrapes are not divided by the speed factor: 30 s/10 s permits
+40 real seconds even at 5×, while KWOK at 5× permits only 3 s + 3 s. Kubelet
+is catalogued when present without becoming required or entering the watermark.
+Removed targets retain their observed policies for historical validation.
+Intervals are assumed stable during one execution; arbitrary historical
+configuration changes are not reconstructed. Raw values, labels, the query grid
+and batch atomicity are unchanged.
+
 Output is automatic: `output_csv_<trace-directory-name>_YYYY-MM-DD-HH:MM:SS`
 in the current directory. `--output-dir PATH` is an optional override, and
 existing outputs are never overwritten. Preserve

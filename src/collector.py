@@ -60,6 +60,7 @@ class Collector:
         self.warnings = set()
         self._last_written = {}
         self.effective_intervals = {}
+        self._source_policies = {}
 
     def log(self, message):
         print(f"[COLLECTOR] {message}")
@@ -103,7 +104,20 @@ class Collector:
         """Inspect loaded target configuration and completed scrapes, not applied manifests."""
         data = self.api('targets', {'state': 'active'})
         kwok, ksm = [], []
+        discovered = {}
         for target in data['activeTargets']:
+            # Retain observed origins for historical samples after node deletion.
+            identity = tuple(sorted((key, value) for key, value in target.get('labels', {}).items()
+                                    if key in ('job', 'instance', 'endpoint', 'service', 'metrics_path')))
+            try:
+                interval = parse_duration(target['scrapeInterval'])
+                timeout = parse_duration(target['scrapeTimeout'])
+                if interval <= 0 or timeout <= 0 or timeout > interval:
+                    raise ValueError('expected 0 < scrapeTimeout <= scrapeInterval')
+                policy = (interval, timeout)
+            except (KeyError, TypeError, ValueError) as error:
+                policy = str(error)
+            discovered.setdefault(identity, set()).add(policy)
             url = target.get('scrapeUrl', '')
             pool = target.get('scrapePool', '')
             if '/metrics/nodes/' in url:
@@ -126,10 +140,38 @@ class Collector:
                         or parse_duration(target['scrapeTimeout']) > interval):
                     raise CollectionError(f'{key} target not ready at requested interval {duration(interval)}')
             self.effective_intervals[key] = interval
+        for identity, policies in discovered.items():
+            self._source_policies.setdefault(identity, set()).update(policies)
         timestamps = []
         for target in kwok + ksm:
             timestamps.append(datetime.fromisoformat(target['lastScrape'].replace('Z', '+00:00')).timestamp())
         return min(timestamps)
+
+    def source_policy(self, labels):
+        """Resolve scrape identity without treating workload labels as target labels."""
+        origin = {key: labels[key] for key in ('job', 'instance', 'endpoint', 'service', 'metrics_path')
+                  if key in labels}
+        policies = set()
+        if origin.get('job') and origin.get('instance'):
+            for identity, candidates in self._source_policies.items():
+                target = dict(identity)
+                if (all(target.get(key) == origin[key] for key in ('job', 'instance'))
+                        and all(origin[key] == target[key] for key in origin.keys() & target.keys())):
+                    policies.update(candidates)
+        if not policies:
+            raise CollectionError(f'unresolved scrape origin: {origin}')
+        if any(isinstance(policy, str) for policy in policies):
+            raise CollectionError(f'invalid scrape configuration for origin {origin}: {policies}')
+        if len(policies) != 1:
+            raise CollectionError(f'ambiguous scrape origin {origin}: {sorted(policies)}')
+        return origin, next(iter(policies))
+
+    def validate_source_age(self, metric, origin, policy, timestamp, source):
+        interval, timeout = policy
+        max_age = interval + timeout
+        if source is None or not math.isfinite(source) or timestamp - source > max_age + .001:
+            raise CollectionError(f'{metric}: missing or stale scrape at {timestamp}; '
+                                  f'origin={origin}, max_age={max_age}s')
 
     def wait_ready(self, intervals, nodes=(), timeout=180, monotonic=time.monotonic, wait=time.sleep, unix_time=time.time):
         previous_deadline = self.request_deadline
@@ -143,11 +185,13 @@ class Collector:
                     for metric in self.read_metrics():
                         if metric in REQUIRED_METRICS | MEMORY_METRICS:
                             data = self.api('query', {'query': f'timestamp({metric})'})
-                            interval = intervals.kwok if metric.startswith('container_') else intervals.ksm
                             values = data.get('result', [])
-                            if values and all(math.isfinite(float(item['value'][1])) and
-                                              unix_time() - float(item['value'][1]) <= interval + min(10, interval) + .001
-                                              for item in values):
+                            for item in values:
+                                value = item.get('value')
+                                origin, policy = self.source_policy(item['metric'])
+                                self.validate_source_age(metric, origin, policy, unix_time(),
+                                                         float(value[1]) if value else None)
+                            if values:
                                 available.add(metric)
                     self.require_metrics(available)
                     return dict(self.effective_intervals)
@@ -163,19 +207,18 @@ class Collector:
         if not results:
             return
         sources = self.request_metrics(f'timestamp({metric})', start, end)
-        interval = self.intervals.kwok if metric.startswith('container_') else self.intervals.ksm
-        max_age = interval + min(10, interval)  # Allow one real scrape timeout for ingestion.
         observed = {}
         for series in sources:
             labels = tuple(sorted((key, value) for key, value in series['metric'].items() if key != '__name__'))
             for timestamp, source_timestamp in series['values']:
                 observed[(labels, round(float(timestamp), 3))] = float(source_timestamp)
         for series in results:
+            # Resolve once per series, not once per grid point.
+            origin, policy = self.source_policy(series['metric'])
             labels = tuple(sorted((key, value) for key, value in series['metric'].items() if key != '__name__'))
             for timestamp, _ in series['values']:
                 source = observed.get((labels, round(float(timestamp), 3)))
-                if source is None or not math.isfinite(source) or float(timestamp) - source > max_age + .001:
-                    raise CollectionError(f'{metric}: missing or stale scrape at {timestamp}')
+                self.validate_source_age(metric, origin, policy, float(timestamp), source)
 
     def _write(self, output_dir, metric, results):
         if not results:
