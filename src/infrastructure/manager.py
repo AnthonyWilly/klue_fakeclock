@@ -3,6 +3,7 @@ This module defines the InfrastructureManager class, which manages the setup, em
 for trace-driven experiments. It handles applying Kubernetes objects, managing node pools, and coordinating emulation phases.
 """
 
+from run_report import setup_phase, setup_progress
 import json
 import time
 from experiment_clock import ExperimentClock, ReplayDiagnostics, replay_entries, validate_speed_factor
@@ -54,17 +55,21 @@ class InfrastructureManager:
         the cluster.
         """
         setup = self.data['setup']
-        for infra_obj in setup:
-            node_name = infra_obj["metadata"]["name"]
-            self.k8s_object_applier.apply_object(infra_obj)
-            self.log(f"[INFO] Node {node_name} applied.")
+        with setup_phase(self, 'nodes_apply', parent='nodes', expected=len(setup), concurrency=1, unit='objects'):
+            for index, infra_obj in enumerate(setup):
+                node_name = infra_obj["metadata"]["name"]
+                self.k8s_object_applier.apply_object(infra_obj)
+                setup_progress(self, 'nodes_apply', completed=index + 1)
+                self.log(f"[INFO] Node {node_name} applied.")
 
-        while self.input_data_node_count != self.node_count:
-            nodes = self.k8s_api.list_node()
-            print(f"[INFO] Waiting for nodes to be created. Expected: {self.input_data_node_count}, Current: {len(nodes.items) - self.AMOUNT_OF_REAL_NODES}")
-            self.node_count = len(nodes.items) - self.AMOUNT_OF_REAL_NODES
-            self.log(f"[INFO] Node count: {self.node_count}")
-            time.sleep(2)
+        with setup_phase(self, 'nodes_converge', parent='nodes', expected=self.input_data_node_count, unit='observed_nodes'):
+            while self.input_data_node_count != self.node_count:
+                nodes = self.k8s_api.list_node()
+                print(f"[INFO] Waiting for nodes to be created. Expected: {self.input_data_node_count}, Current: {len(nodes.items) - self.AMOUNT_OF_REAL_NODES}")
+                self.node_count = len(nodes.items) - self.AMOUNT_OF_REAL_NODES
+                setup_progress(self, 'nodes_converge', completed=self.node_count)
+                self.log(f"[INFO] Node count: {self.node_count}")
+                time.sleep(2)
 
     def before_emulation(self):
         """

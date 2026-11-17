@@ -200,6 +200,33 @@ Progress snapshots refresh during replay. Full action and lag context remains
 in the execution log; Kubernetes object bodies and kubeconfig are not copied
 into the report.
 
+The additive `phases` map records monotonic start/end, inclusive `duration_real`,
+`result`, `parent`, expected/completed counts, failures, count `unit` and effective
+operation `concurrency` where known. Unstarted phases are absent; unknown counts
+or concurrency are null. Older version 1 reports without this map remain valid.
+Installation returns a local `setup-measurements.jsonl` journal; the shell imports
+it only after the synchronous setup process exits. Python owns `run.json` while
+replaying, and workers never update the report themselves.
+
+Phases cover external installation, tracing, node/workload application and
+convergence, initial usage submission, mapping, scheduler build/binds,
+port-forward, metrics readiness, usage acknowledgements, final collection,
+teardown and compression. Parent durations include their children; compare
+siblings or top-level phases, without summing parents and children. Setup and
+bind concurrency are currently 1 at every factor; usage pod-write concurrency
+remains separately reported. Application counts measure successful calls,
+`initial_usage` counts submissions/scales, and `initial_usage_drain` counts worker
+acknowledgements. Convergence counts retain the existing observed node/pod policy;
+a pod-count timeout is recorded as `timed_out` even when setup proceeds. Failure
+and interruption retain partial counts and elapsed time. These diagnostics do
+not change readiness policy or prove correct pod placement.
+
+The archive phase uses `recorded_before_close`: its final snapshot includes CSV
+compression but precedes writing `run.json` into the ZIP and closing the archive.
+`timing.total_real` has the same internal boundary. Measure wall time around the
+complete shell command for end-to-end comparisons through ZIP readiness; no
+second archive is created to include the cost of archiving itself.
+
 Statuses are `running`, `completed`, `completed_with_warnings`, `failed`, or
 `interrupted`. Late events preserve input order and produce warnings. Failed
 applications, lost usage acknowledgements, premature worker termination,
@@ -212,7 +239,7 @@ Timing separates preparation, replay and finalization, including an explicit
 15-logical-second observation tail after the usage queue drains. The effective
 factor divides scheduled logical duration by real replay duration and excludes
 the tail and preparation/finalization. Incomplete replays have no effective
-factor. Unstarted phases are null. These are operational diagnostics; the
+factor. Unstarted timing fields are null. These are operational diagnostics; the
 report makes no fidelity judgment. SIGINT/SIGTERM attempt orderly cleanup;
 SIGKILL, machine loss or unavailable storage may leave the initial `running`
 report without a final result.

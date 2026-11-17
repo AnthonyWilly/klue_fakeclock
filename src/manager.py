@@ -52,7 +52,8 @@ class Manager:
 
         self.report.update(configuration=dict(self.report.data['configuration'], karpenter=karpenter, hpa=hpa,
             infrastructure=infrastructure, workload=workload, speed_factor=self.speed_factor,
-            requested_intervals=self.intervals.snapshot(), requested_workers=self.workers_override))
+            requested_intervals=self.intervals.snapshot(), requested_workers=self.workers_override,
+            setup_concurrency=1, bind_concurrency=1))
         for name in ('infrastructure_description.json', 'workload_description.json'):
             self.report.trace(Path(data_path) / name, 'replay')
         self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure, speed_factor=self.speed_factor)
@@ -79,8 +80,10 @@ class Manager:
         1. Executes the `run` method of the `pods_mapping` object to initiate pod mapping.
         2. Runs the `build-scheduler.sh` script using a subprocess call to set up the scheduler.
         """
-        self.pods_mapping.run()
-        subprocess.run(["bash", "src/build-scheduler.sh"], check=True)
+        with self.report.phase('mapping', parent='preparation', concurrency=1):
+            self.pods_mapping.run()
+        with self.report.phase('scheduler_build_binds', parent='preparation', concurrency=1):
+            subprocess.run(["bash", "src/build-scheduler.sh"], check=True)
 
     def prepare_observability(self):
         api = self.service_monitor_manager.k8s_api
@@ -265,19 +268,37 @@ class Manager:
 
         try:
             report.stage('preparation')
-            self.infrastructure_manager.before_setup()
-            self.workload_manager.before_setup()
-            self.service_monitor_manager.start()
-            monitor_started = True
-            self.infrastructure_manager.setup()
-            self.workload_manager.setup()
-            self.start_mapping_and_scheduler()
-            self.workload_manager.before_emulation()
-            self.infrastructure_manager.before_emulation()
-            subprocess.run(['bash', 'src/port-forward.sh'], check=True)
-            self.prepare_observability()
-            self.workload_manager.check_usage()
-            self.workload_manager.drain_usage(check=check_threads)
+            with report.phase('preparation', concurrency=1):
+                # Only the coordinator and these synchronous setup methods write.
+                self.infrastructure_manager.report = report
+                self.workload_manager.report = report
+                with report.phase('before_setup', parent='preparation', concurrency=1):
+                    self.infrastructure_manager.before_setup()
+                    self.workload_manager.before_setup()
+                    self.service_monitor_manager.start()
+                    monitor_started = True
+                with report.phase('nodes', parent='preparation', concurrency=1):
+                    self.infrastructure_manager.setup()
+                with report.phase('workloads', parent='preparation', concurrency=1):
+                    self.workload_manager.setup()
+                self.start_mapping_and_scheduler()
+                with report.phase('before_emulation', parent='preparation', concurrency=1):
+                    self.workload_manager.before_emulation()
+                    self.infrastructure_manager.before_emulation()
+                with report.phase('port_forward', parent='preparation', concurrency=1):
+                    subprocess.run(['bash', 'src/port-forward.sh'], check=True)
+                with report.phase('metrics_ready', parent='preparation', concurrency=1):
+                    self.prepare_observability()
+                with report.phase('initial_usage_drain', parent='preparation',
+                                  concurrency=self.workload_manager.usage_progress.get('api_concurrency'),
+                                  unit='usage_acknowledgements'):
+                    self.workload_manager.check_usage()
+                    try:
+                        self.workload_manager.drain_usage(check=check_threads)
+                    finally:
+                        progress = self.workload_manager.usage_progress
+                        report.phase_progress('initial_usage_drain', expected=progress['enqueued'],
+                                              completed=progress['completed'], failed=progress['failed'])
             self.clock.start()
             scheduled = max((entry['timestamp'] for manager in
                 (self.infrastructure_manager, self.workload_manager)
@@ -316,6 +337,7 @@ class Manager:
                                             if complete and replay_end > self.clock.origin_monotonic else None))
             finalization_start = replay_end
             report.stage('collection')
+            report.begin_phase('final_collection')
             tail_start = self.clock.monotonic()
             self.clock.tail()
             report.timing(tail_real=self.clock.monotonic() - tail_start)
@@ -344,6 +366,8 @@ class Manager:
                               progress_logical=max(timestamps), effective_factor=None)
             elif self.clock.origin_monotonic is None:
                 report.timing(preparation_real=now - report.data['timing']['started_monotonic'])
+            if collector_thread and 'final_collection' not in report.data.get('phases', {}):
+                report.begin_phase('final_collection')
             self.collection_end = time.time()
             self.collection_stop.set()
             if collector_thread:
@@ -353,22 +377,34 @@ class Manager:
                                  component='collector', stage='collection')
                 elif not self.collection_diagnostics['complete'] and not self.collection_error:
                     report.issue('required collection incomplete', component='collector', stage='collection')
+            if 'final_collection' in report.data.get('phases', {}):
+                report.end_phase('final_collection', result=(
+                    'interrupted' if interrupted or report.interruption_requested else
+                    'completed' if self.collection_diagnostics['complete'] else 'failed'))
             report.stage('teardown')
+            report.begin_phase('teardown')
             cleanups = [('workload', self.workload_manager.tear_down),
                         ('infrastructure', self.infrastructure_manager.tear_down)]
             if monitor_started:
                 cleanups.append(('service_monitor', self.service_monitor_manager.stop))
             for name, cleanup in cleanups:
                 try:
-                    cleanup()
+                    with report.phase(f'teardown_{name}', parent='teardown', concurrency=1):
+                        cleanup()
                 except BaseException as error:
                     interrupted = interrupted or isinstance(error, (KeyboardInterrupt, SystemExit))
                     report.issue(error, component=name)
+            cleanup_results = {phase['result'] for phase in report.data['phases'].values()
+                               if phase['parent'] == 'teardown'}
+            report.end_phase('teardown', result='interrupted' if 'interrupted' in cleanup_results else
+                             'failed' if 'failed' in cleanup_results else 'completed')
             self.snapshot()
             def finalize():
+                report.end_phase('archive', result='recorded_before_close')
                 report.timing(finalization_real=self.clock.monotonic() - finalization_start)
                 report.finish(interrupted=interrupted)
             report.stage('archive')
+            report.begin_phase('archive', concurrency=1)
             finalize()
             try:
                 self.collector.archive(self.output_dir, finalize=finalize)
@@ -376,5 +412,6 @@ class Manager:
                 interrupted = interrupted or isinstance(error, (KeyboardInterrupt, SystemExit))
                 report.issue(error, component='archive', stage='archive')
                 finalize()
+                report.end_phase('archive', result='interrupted' if interrupted else 'failed')
         if report.data['status'] in ('failed', 'interrupted'):
             raise RuntimeError(f"emulation {report.data['status']}; see {report.path}")

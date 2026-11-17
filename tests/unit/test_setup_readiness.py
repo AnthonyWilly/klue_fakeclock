@@ -19,7 +19,7 @@ def test_fresh_setup_waits_for_prometheus_and_propagates_timeout(tmp_path, fail_
     shutil.copy(ROOT / 'kwok-karpenter-install/setup.sh', install / 'setup.sh')
     src = tmp_path / 'src'
     src.mkdir()
-    for name in ('kwok_config.py', 'sampling.py', 'experiment_clock.py'):
+    for name in ('kwok_config.py', 'sampling.py', 'experiment_clock.py', 'run_report.py'):
         shutil.copy(ROOT / 'src' / name, src / name)
     for name in ('install-kwok.sh', 'setup-vpa.sh'):
         stub = install / name
@@ -61,9 +61,19 @@ elif name == 'envsubst':
         (bindir / name).symlink_to(shim)
     env = dict(os.environ, PATH=str(bindir) + ':' + str(Path(sys.executable).parent) + ':' + os.environ['PATH'],
                KLUE_TEST_CALLS=str(calls), KLUE_TEST_FAIL_CREATION=str(int(fail_creation)),
+               KLUE_SETUP_MEASUREMENTS=str(tmp_path / 'setup.jsonl'),
                KLUE_SPEED_FACTOR='1', KLUE_KWOK_WORKERS_CONFIG='')
     result = subprocess.run(['bash', 'setup.sh', 'karpenter-off'], cwd=install,
         env=env, capture_output=True, text=True, timeout=10)
+    from run_report import RunReport
+    report = RunReport(tmp_path / 'report')
+    report.import_measurements(env['KLUE_SETUP_MEASUREMENTS'])
+    phases = report.data['phases']
+    assert phases['install_tools']['result'] == 'completed'
+    assert phases['prometheus_ready']['result'] == ('failed' if fail_creation else 'completed')
+    assert phases['prometheus_ready']['failed'] == int(fail_creation)
+    assert all(phase['parent'] == 'external_setup' and phase['duration_real'] >= 0 for phase in phases.values())
+    assert ('configure_grafana' in phases) != fail_creation
     commands = [json.loads(line) for line in calls.read_text().splitlines()]
     create = ['kubectl', '-n', 'monitoring', 'wait', '--for=create', 'pod/prometheus-k8s-0', '--timeout=300s']
     ready = ['kubectl', '-n', 'monitoring', 'wait', '--for=condition=Ready', 'pod/prometheus-k8s-0', '--timeout=300s']

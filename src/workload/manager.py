@@ -2,6 +2,7 @@
 This module defines the WorkloadManager class, which serves as a base class for managing workloads in a trace emulation environment.
 """
 
+from run_report import setup_phase, setup_progress
 import json
 import time
 from experiment_clock import ExperimentClock, ReplayDiagnostics, replay_entries, validate_speed_factor
@@ -78,22 +79,37 @@ class WorkloadManager:
         target_namespaces = set(applied_objects.keys())
         pods_before_setup = self.count_pods_in_namespaces(target_namespaces)
 
-        self.log(f"[INFO] Deploying setup objects")
-        for namespace, objects in applied_objects.items():
-            self.create_namespace_if_not_exists(namespace)
-            for object in objects:
-                if object.get("kind", "").lower() not in self.BEFORE_EMULATION_KINDS:
-                    self.k8s_object_applier.apply_object(object)
+        expected = sum(1 for objects in applied_objects.values() for obj in objects
+                       if obj.get("kind", "").lower() not in self.BEFORE_EMULATION_KINDS)
+        with setup_phase(self, 'workloads_apply', parent='workloads', expected=expected, concurrency=1, unit='operations'):
+            completed = 0
+            self.log(f"[INFO] Deploying setup objects")
+            for namespace, objects in applied_objects.items():
+                self.create_namespace_if_not_exists(namespace)
+                for object in objects:
+                    if object.get("kind", "").lower() not in self.BEFORE_EMULATION_KINDS:
+                        self.k8s_object_applier.apply_object(object)
+                        completed += 1
+                        setup_progress(self, 'workloads_apply', completed=completed)
 
-        self.wait_pods_ready(pods_before_setup)
+        with setup_phase(self, 'workloads_converge', parent='workloads', unit='observed_pods'):
+            self.wait_pods_ready(pods_before_setup)
 
-        self.log(f"[INFO] Applying workload actions on setup")
-        for workload_action in workload_actions:
-            action = workload_action["action"]
-            if action == "set-usage":
-                self.set_workload_usage(workload_action)
-            elif action == "scale" and not self.hpa:
-                self.scale_workload(workload_action)
+        expected = sum(action['action'] == 'set-usage' or (action['action'] == 'scale' and not self.hpa)
+                       for action in workload_actions)
+        with setup_phase(self, 'initial_usage', parent='workloads', expected=expected, concurrency=1, unit='operations'):
+            completed = 0
+            self.log(f"[INFO] Applying workload actions on setup")
+            for workload_action in workload_actions:
+                action = workload_action["action"]
+                if action == "set-usage":
+                    self.set_workload_usage(workload_action)
+                elif action == "scale" and not self.hpa:
+                    self.scale_workload(workload_action)
+                else:
+                    continue
+                completed += 1
+                setup_progress(self, 'initial_usage', completed=completed)
 
     def before_emulation(self):
         if not self.hpa:
@@ -295,16 +311,20 @@ class WorkloadManager:
                     self.log(f"[WARNING] Object is not a Deployment or StatefulSet but has replicas={replica_count}. Counting it as workload.")
                     expected_pods += replica_count
 
+        setup_progress(self, 'workloads_converge', expected=expected_pods)
         target_namespaces = set(self.data['setup']['applied_objects'].keys())
         
         # Almost 7 pods are created per second, the timeout is derived from expected pod count.
         deadline = time.monotonic() + int(expected_pods / 7)
         while True:
             current_pods = self.count_pods_in_namespaces(target_namespaces) - pods_before_setup
+            setup_progress(self, 'workloads_converge', completed=current_pods)
             if current_pods >= expected_pods:
                 self.log(f"[INFO] All pods created. Current: {current_pods}, Expected: {expected_pods}")
                 break
             if time.monotonic() >= deadline:
+                if getattr(self, 'report', None) is not None:
+                    self.report.end_phase('workloads_converge', result='timed_out')
                 self.log(f"[WARNING] Timeout waiting for pods. Current: {current_pods}, Expected: {expected_pods}. Proceeding anyway.")
                 break
             self.log(f"[INFO] Current pods: {current_pods}, Expected: {expected_pods}")

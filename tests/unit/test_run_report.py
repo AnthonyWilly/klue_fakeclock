@@ -101,3 +101,67 @@ def test_existing_archive_is_not_overwritten(tmp_path):
     with pytest.raises(FileExistsError, match='archive already exists'):
         RunReport(tmp_path / 'out')
     assert archive.read_bytes() == b'previous run'
+
+
+def test_nested_phases_are_inclusive_and_preserve_partial_counts(tmp_path):
+    now = [10.0]
+    report = RunReport(tmp_path / 'out', monotonic=lambda: now[0])
+    with pytest.raises(TimeoutError):
+        with report.phase('setup', concurrency=1):
+            now[0] = 12
+            with report.phase('apply', parent='setup', expected=4, concurrency=1):
+                report.phase_progress('apply', completed=2)
+                now[0] = 15
+                raise TimeoutError('deadline')
+    phases = json.loads(report.path.read_text())['phases']
+    assert phases['setup']['duration_real'] == 5
+    assert phases['apply']['duration_real'] == 3
+    assert phases['apply']['parent'] == 'setup'
+    assert phases['apply']['completed'] == 2
+    assert phases['apply']['expected'] == 4
+    assert phases['apply']['failed'] == 1
+    assert phases['setup']['result'] == phases['apply']['result'] == 'failed'
+    assert report.data['timing']['effective_factor'] is None
+    assert 'replay' not in phases
+
+
+def test_phase_interruption_and_unfinished_shell_phase(tmp_path):
+    now = [10.0]
+    report = RunReport(tmp_path / 'out', monotonic=lambda: now[0])
+    report.begin_phase('external_setup')
+    with pytest.raises(KeyboardInterrupt):
+        with report.phase('install', parent='external_setup'):
+            now[0] = 13
+            raise KeyboardInterrupt()
+    report.finish(interrupted=True)
+    assert report.data['phases']['external_setup']['result'] == 'interrupted'
+    assert report.data['phases']['install']['duration_real'] == 3
+    assert report.data['phases']['install']['result'] == 'interrupted'
+
+
+def test_import_child_measurements_is_idempotent_and_uses_child_clock(tmp_path):
+    report = RunReport(tmp_path / 'out', monotonic=lambda: 20)
+    journal = tmp_path / 'measurements.jsonl'
+    journal.write_text('\n'.join(json.dumps(event) for event in [
+        dict(name='tools', event='begin', time=11, exit_code=0),
+        dict(name='tools', event='end', time=15, exit_code=23),
+        dict(name='monitoring', event='begin', time=16, exit_code=0)]))
+    report.import_measurements(journal)
+    report.import_measurements(journal)
+    assert report.data['phases']['tools']['duration_real'] == 4
+    assert report.data['phases']['tools']['result'] == 'failed'
+    assert report.data['phases']['tools']['failed'] == 1
+    report.finish(interrupted=True)
+    assert report.data['phases']['monitoring']['result'] == 'interrupted'
+    assert report.data['phases']['monitoring']['duration_real'] == 4
+
+
+def test_incomplete_child_journal_retains_started_phase(tmp_path):
+    report = RunReport(tmp_path / 'out', monotonic=lambda: 20)
+    journal = tmp_path / 'measurements.jsonl'
+    journal.write_text(json.dumps(dict(name='tools', event='begin', time=11, exit_code=0)) + '\n{"name":')
+    report.import_measurements(journal)
+    report.finish(interrupted=True)
+    assert report.data['phases']['tools']['duration_real'] == 9
+    assert report.data['phases']['tools']['result'] == 'interrupted'
+    assert report.data['warning_count'] == 1

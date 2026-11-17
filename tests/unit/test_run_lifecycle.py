@@ -291,6 +291,9 @@ def test_setup_failure_before_main_is_reported_by_real_shell(tmp_path):
     assert result.returncode == 23, result.stdout + result.stderr
     data = json.loads((output / 'run.json').read_text())
     assert data['status'] == 'failed'
+    assert data['phases']['external_setup']['result'] == 'failed'
+    assert data['phases']['external_setup']['failed'] == 1
+    assert data['phases']['external_setup']['duration_real'] >= 0
     assert data['errors'][0]['stage'] == 'setup'
     assert '23' in data['errors'][0]['message']
     assert data['timing']['replay_real'] is None
@@ -436,3 +439,128 @@ def test_usage_drain_deadline_does_not_wait_on_dead_queue():
         parent.finish_usage(timeout=0)
     parent.usage_queue.put.assert_called_once_with('STOP')
     assert parent.usage_progress['pending'] == 2
+
+
+def test_lifecycle_phase_times_and_archive_snapshot(lifecycle, monkeypatch):
+    result, report, now = lifecycle
+    write = zipfile.ZipFile.write
+    def slow_write(archive, filename, *args, **kwargs):
+        if str(filename).endswith('.csv'):
+            now[0] += 3
+        return write(archive, filename, *args, **kwargs)
+    monkeypatch.setattr(zipfile.ZipFile, 'write', slow_write)
+    result.run()
+    phases = report.data['phases']
+    assert phases['preparation']['duration_real'] == 4
+    assert phases['metrics_ready']['duration_real'] == 4
+    assert phases['metrics_ready']['parent'] == 'preparation'
+    assert phases['initial_usage_drain']['completed'] == 3
+    assert phases['final_collection']['duration_real'] == 7.5
+    assert phases['archive']['duration_real'] == 3
+    assert phases['archive']['result'] == 'recorded_before_close'
+    assert report.data['timing']['effective_factor'] == 2
+    with zipfile.ZipFile(result.output_dir + '.zip') as archive:
+        assert json.loads(archive.read('run.json')) == report.data
+
+
+def test_unstarted_collection_absent_after_setup_interruption(lifecycle):
+    result, report, now = lifecycle
+    def stop():
+        now[0] += 2
+        raise KeyboardInterrupt('stop')
+    result.workload_manager.setup.side_effect = stop
+    with pytest.raises(RuntimeError, match='interrupted'):
+        result.run()
+    assert report.data['phases']['workloads']['result'] == 'interrupted'
+    assert report.data['phases']['workloads']['duration_real'] == 2
+    assert 'final_collection' not in report.data['phases']
+    assert 'metrics_ready' not in report.data['phases']
+
+
+def test_setup_records_application_progress_and_existing_pod_timeout(tmp_path, monkeypatch):
+    import workload.manager as workload_module
+    report = RunReport(tmp_path / 'out', monotonic=lambda: 50)
+    parent = WorkloadManager.__new__(WorkloadManager)
+    parent.report = report
+    parent.hpa = False
+    parent.BEFORE_EMULATION_KINDS = {'horizontalpodautoscaler'}
+    parent.usage_manager = Mock()
+    parent.k8s_object_applier = Mock()
+    parent.create_namespace_if_not_exists = Mock()
+    parent.count_pods_in_namespaces = Mock(return_value=0)
+    parent.set_workload_usage = Mock(side_effect=[None, RuntimeError('usage enqueue failed')])
+    parent.data = {'setup': {'applied_objects': {'ns': [
+        {'kind': 'Deployment', 'spec': {'replicas': 14}},
+        {'kind': 'ConfigMap'}, {'kind': 'HorizontalPodAutoscaler'}]},
+        'workload_actions': [{'action': 'set-usage'}, {'action': 'set-usage'}]}}
+    times = iter([10, 13])
+    monkeypatch.setattr(workload_module.time, 'monotonic', lambda: next(times))
+    with pytest.raises(RuntimeError, match='usage enqueue failed'):
+        parent.setup()
+    phases = report.data['phases']
+    assert phases['workloads_apply']['expected'] == 2
+    assert phases['workloads_apply']['completed'] == 2
+    assert phases['workloads_apply']['concurrency'] == 1
+    assert phases['workloads_converge']['result'] == 'timed_out'
+    assert phases['workloads_converge']['expected'] == 14
+    assert phases['workloads_converge']['completed'] == 0
+    assert phases['initial_usage']['completed'] == 1
+    assert phases['initial_usage']['failed'] == 1
+    parent.create_namespace_if_not_exists.assert_called_once_with('ns')
+
+
+def test_node_setup_failure_retains_applied_count(tmp_path):
+    from infrastructure.manager import InfrastructureManager
+    parent = InfrastructureManager.__new__(InfrastructureManager)
+    parent.report = RunReport(tmp_path / 'out')
+    parent.data = {'setup': [{'metadata': {'name': 'a'}}, {'metadata': {'name': 'b'}}]}
+    parent.k8s_object_applier = Mock()
+    parent.k8s_object_applier.apply_object.side_effect = [None, RuntimeError('denied')]
+    with pytest.raises(RuntimeError, match='denied'):
+        parent.setup()
+    phase = parent.report.data['phases']['nodes_apply']
+    assert phase['expected'] == 2
+    assert phase['completed'] == 1
+    assert phase['failed'] == 1
+    assert 'nodes_converge' not in parent.report.data['phases']
+
+
+def test_shell_setup_interrupt_imports_partial_child_phase(tmp_path):
+    import signal
+    import time
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'kwok-karpenter-install').mkdir()
+    for name in ('run_report.py', 'experiment_clock.py'):
+        shutil.copy(ROOT / 'src' / name, tmp_path / 'src' / name)
+    shutil.copy(ROOT / 'execute-emulation.sh', tmp_path / 'execute-emulation.sh')
+    setup = tmp_path / 'kwok-karpenter-install/setup.sh'
+    setup.write_text('''#!/bin/bash
+python3 ../src/run_report.py measurement --measurements "$KLUE_SETUP_MEASUREMENTS" --phase install_tools --event begin
+touch ready
+while true; do sleep .05; done
+''')
+    setup.chmod(0o755)
+    output = tmp_path / 'output'
+    env = dict(os.environ, PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'])
+    process = subprocess.Popen(['bash', 'execute-emulation.sh', '--sim', '--data-path', 'unused',
+                                '--output-dir', str(output)], cwd=tmp_path, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 5
+        while not (setup.parent / 'ready').exists():
+            assert process.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 143, stdout + stderr
+        data = json.loads((output / 'run.json').read_text())
+        assert data['status'] == 'interrupted'
+        for name in ('external_setup', 'install_tools'):
+            assert data['phases'][name]['result'] == 'interrupted'
+            assert data['phases'][name]['duration_real'] >= 0
+        assert 'preparation' not in data['phases']
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)

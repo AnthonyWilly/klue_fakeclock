@@ -8,6 +8,32 @@ if [[ -n ${KLUE_KWOK_WORKERS_CONFIG:-} ]]; then
     python3 "$SCRIPT_DIR/../src/kwok_config.py" validate --workers-config "$KLUE_KWOK_WORKERS_CONFIG" || exit $?
 fi
 
+# Synchronous phase journal: the caller imports it after wait, including on failure.
+# Direct setup invocation without a report keeps its original behavior.
+measure() {
+    [[ -z ${KLUE_SETUP_MEASUREMENTS:-} ]] && return 0
+    python3 "$SCRIPT_DIR/../src/run_report.py" measurement \
+        --measurements "$KLUE_SETUP_MEASUREMENTS" --phase "$1" --event "$2" --exit-code "${3:-0}"
+}
+CURRENT_PHASE=""
+setup_phase() {
+    if [[ -n $CURRENT_PHASE ]]; then
+        measure "$CURRENT_PHASE" end
+    fi
+    CURRENT_PHASE="$1"
+    measure "$CURRENT_PHASE" begin
+}
+finish_measurement() {
+    local code=$?
+    trap - EXIT
+    if [[ -n $CURRENT_PHASE ]]; then
+        measure "$CURRENT_PHASE" end "$code"
+    fi
+    exit "$code"
+}
+trap finish_measurement EXIT
+setup_phase install_tools
+
 go install github.com/google/ko@latest
 export PATH=$PATH:~/go/bin
 
@@ -20,6 +46,8 @@ if [ $# -lt 1 ]; then
 fi
 
 KARPENTER="$1"
+
+setup_phase install_monitoring
 
 # Setup Prometheus and Grafana
 
@@ -53,9 +81,11 @@ kubectl -n monitoring patch servicemonitor kube-state-metrics --type=merge \
     --patch-file "$KSM_OVERLAY.patched" || exit $?
 rm -f "$KSM_OVERLAY" "$KSM_OVERLAY.patched"
 
+setup_phase registry_login
 docker login
 
 if [ "$KARPENTER" = "karpenter-on" ]; then
+	setup_phase install_karpenter
 	cd karpenter-code
 
 	make toolchain
@@ -69,10 +99,12 @@ if [ "$KARPENTER" = "karpenter-on" ]; then
 	kubectl apply -f configuration-files/karpenter-servicemonitor.yml
 fi
 
+setup_phase install_kwok
 ./install-kwok.sh || exit $?
 
 # The operator creates this pod asynchronously, especially on a fresh cluster.
 # A get before creation exits under set -e; wait for creation and then readiness.
+setup_phase prometheus_ready
 echo "Waiting for Prometheus to be created and ready..."
 kubectl -n monitoring wait --for=create pod/prometheus-k8s-0 --timeout=300s
 kubectl -n monitoring wait --for=condition=Ready pod/prometheus-k8s-0 --timeout=300s
@@ -83,6 +115,7 @@ echo "Prometheus is ready."
 # Grafana configuration
 # -----------------------------
 
+setup_phase configure_grafana
 echo "▶ Detecting Minikube IP"
 MINIKUBE_IP=$(minikube ip)
 
@@ -116,6 +149,7 @@ echo "👉 Open: http://${MINIKUBE_IP}:32000"
 # VPA configuration
 # -----------------------------
 
+setup_phase install_vpa
 chmod +x setup-vpa.sh
 
 ./setup-vpa.sh # to use vpa, you need to apply an .yaml manifest with VPA configuration, e.g. vpa.yaml

@@ -5,6 +5,7 @@ to handle the emulation steps. The script interacts with Kubernetes and processe
 files to simulate cluster behavior.
 """
 import argparse
+from contextlib import nullcontext
 from experiment_clock import validate_speed_factor
 from run_report import RunReport
 import signal
@@ -127,7 +128,8 @@ def main(argv=None):
                         args.speed_factor, args.kwok_workers_config, report=report)
         instance.apply_nodepool()
         report.stage('tracer')
-        instance.run_tracer()
+        with report.phase('tracer', concurrency=1) if not instance.tracer_skip else nullcontext():
+            instance.run_tracer()
         report.stage('preparation')
         instance.run_manager()
         return 0

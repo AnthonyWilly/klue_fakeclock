@@ -137,6 +137,9 @@ KLUE_RUN_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["r
 finish_report() {
     local code=$?
     trap - EXIT INT TERM
+    if [[ -n ${KLUE_SETUP_MEASUREMENTS:-} ]]; then
+        python3 "$REPORT_HELPER" import --output-dir "$OUTPUT_DIR" --measurements "$KLUE_SETUP_MEASUREMENTS"
+    fi
     python3 "$REPORT_HELPER" finish --output-dir "$OUTPUT_DIR" --exit-code "$code"
     exit "$code"
 }
@@ -157,6 +160,14 @@ run_step() {
     wait "$ACTIVE_PID"
     local code=$?
     ACTIVE_PID=""
+    return "$code"
+}
+run_setup() {
+    python3 "$REPORT_HELPER" begin --output-dir "$OUTPUT_DIR" --phase external_setup || return $?
+    run_step ./setup.sh "$KARPENTER"
+    local code=$?
+    python3 "$REPORT_HELPER" import --output-dir "$OUTPUT_DIR" --measurements "$KLUE_SETUP_MEASUREMENTS" || return $?
+    python3 "$REPORT_HELPER" end --output-dir "$OUTPUT_DIR" --phase external_setup --exit-code "$code" || return $?
     return "$code"
 }
 trap 'handle_signal INT 130' INT
@@ -199,6 +210,7 @@ if [[ -n $KWOK_WORKERS_CONFIG ]]; then
     python3 "$(dirname "${BASH_SOURCE[0]}")/src/kwok_config.py" validate --workers-config "$KWOK_WORKERS_CONFIG" || exit $?
     workers_args=(--kwok-workers-config "$KWOK_WORKERS_CONFIG")
 fi
+export KLUE_SETUP_MEASUREMENTS="$OUTPUT_DIR/setup-measurements.jsonl"
 export KLUE_SPEED_FACTOR="$SPEED_FACTOR"
 export KLUE_KWOK_WORKERS_CONFIG="$KWOK_WORKERS_CONFIG"
 
@@ -211,11 +223,11 @@ fi
 if [[ $ENVIRONMENT == "development" ]]; then
     echo "Configurando ambiente de desenvolvimento..."
     cd "$SCRIPT_DIR/kwok-karpenter-install" || exit $?
-    run_step ./setup.sh "$KARPENTER" || exit $?
+    run_setup || exit $?
 elif [[ $ENVIRONMENT == "emulation" ]]; then
     echo "Configurando ambiente de emulação..."
     cd "$SCRIPT_DIR/kwok-karpenter-install" || exit $?
-    run_step ./setup.sh "$KARPENTER" || exit $?
+    run_setup || exit $?
     cd ..
     run_step python3 -u src/main.py "$TRACE_PATH" "$NODEPOOL_PATH" "$KARPENTER" "$TRACER" "$INFRASTRUCTURE" "$WORKLOAD" "$HPA" "${workers_args[@]}" --speed-factor="$SPEED_FACTOR" --output-dir "$OUTPUT_DIR"
 fi

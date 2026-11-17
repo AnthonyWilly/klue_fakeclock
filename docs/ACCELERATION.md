@@ -162,6 +162,20 @@ by the existing scripts are external prerequisites.
    duration, excluding preparation, observation tail and finalization. It is null
    for incomplete replays. Finalization includes the tail; do not add it twice.
    A late but complete run may have a lower effective factor than requested.
+   Inspect `phases` for the installation and preparation breakdown, partial
+   counts and effective concurrency. Durations are inclusive: do not sum a
+   parent with its children. Reports without `phases` remain supported.
+   `archive.result=recorded_before_close` marks the internal snapshot before
+   the report itself is written and the ZIP closes. For total command time,
+   measure externally, for example:
+
+   ```bash
+   /usr/bin/time -p ./execute-emulation.sh --sim --use-cluster <context> --data-path <trace> --speed-factor 1 --output-dir /results/timed-1x
+   ```
+
+   Use distinct outputs and identical other arguments for the second factor.
+   Keep cold installation and already-installed preparation measurements
+   separate; the internal `total_real` is not exact time through ZIP readiness.
 
 4. Prepare the original and 1× views and inspect them first:
 
