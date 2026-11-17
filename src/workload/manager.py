@@ -2,8 +2,11 @@
 This module defines the WorkloadManager class, which serves as a base class for managing workloads in a trace emulation environment.
 """
 
+from setup_execution import apply_independent, setup_workers
 from run_report import setup_phase, setup_progress
 import json
+import csv
+from pods_mapping import PodsMapping
 import time
 from experiment_clock import ExperimentClock, ReplayDiagnostics, replay_entries, validate_speed_factor
 from kubernetes import client
@@ -16,11 +19,14 @@ from workload.usage.usage_manager import UsageManager
 
 class WorkloadManager:
     TIME_OUT = 200
+    CREATION_TIMEOUT = 600
+    SCHEDULING_TIMEOUT = 600
     def __init__(self, data_path, emulation_phase, hpa, speed_factor=1):
         """
         Initializes the Workload Manager class.
         """
         self.speed_factor = validate_speed_factor(speed_factor, hpa=hpa)
+        self.setup_concurrency = setup_workers(self.speed_factor)
         self.BEFORE_EMULATION_KINDS = {
             "horizontalpodautoscaler",
         }
@@ -56,16 +62,7 @@ class WorkloadManager:
         pass
 
     def setup(self):
-        """
-        Executes the setup process for the broker.
-
-        The setup data is expected to be structured as follows:
-        - `setup['nodeclaims']`: A list of node claim objects to be applied.
-        - `setup['deployments']`: A dictionary where keys are namespace names and 
-          values are lists of pod objects to be applied within those namespaces.
-
-        Logs the node count during the waiting process.
-        """
+        """Create namespaces, apply resources, confirm new pods, then queue usage."""
         # start UsageManager process
         self.log("[INFO] Starting UsageManager")
         self.usage_manager.start()
@@ -76,24 +73,25 @@ class WorkloadManager:
 
         workload_actions = setup["workload_actions"]
 
-        target_namespaces = set(applied_objects.keys())
-        pods_before_setup = self.count_pods_in_namespaces(target_namespaces)
-
-        expected = sum(1 for objects in applied_objects.values() for obj in objects
-                       if obj.get("kind", "").lower() not in self.BEFORE_EMULATION_KINDS)
-        with setup_phase(self, 'workloads_apply', parent='workloads', expected=expected, concurrency=1, unit='operations'):
-            completed = 0
-            self.log(f"[INFO] Deploying setup objects")
-            for namespace, objects in applied_objects.items():
-                self.create_namespace_if_not_exists(namespace)
-                for object in objects:
-                    if object.get("kind", "").lower() not in self.BEFORE_EMULATION_KINDS:
-                        self.k8s_object_applier.apply_object(object)
-                        completed += 1
-                        setup_progress(self, 'workloads_apply', completed=completed)
+        self.expected_owners = self.setup_owners()
+        self.pods_before_setup = {
+            (pod.metadata.namespace, pod.metadata.name)
+            for pod in self.k8s_api.list_pod_for_all_namespaces(_request_timeout=10).items}
+        objects = []
+        for namespace, entries in applied_objects.items():
+            self.create_namespace_if_not_exists(namespace)
+            for obj in entries:
+                if obj.get('kind', '').lower() not in self.BEFORE_EMULATION_KINDS:
+                    if obj['metadata'].get('namespace', 'default') != namespace:
+                        raise ValueError(f'Object namespace differs from setup namespace: {namespace}')
+                    objects.append(obj)
+        workers = getattr(self, 'setup_concurrency', 1)
+        with setup_phase(self, 'workloads_apply', parent='workloads', expected=len(objects), concurrency=workers, unit='operations'):
+            apply_independent(objects, self.k8s_object_applier.apply_object, workers,
+                              lambda count: setup_progress(self, 'workloads_apply', completed=count))
 
         with setup_phase(self, 'workloads_converge', parent='workloads', unit='observed_pods'):
-            self.wait_pods_ready(pods_before_setup)
+            self.wait_pods_created()
 
         expected = sum(action['action'] == 'set-usage' or (action['action'] == 'scale' and not self.hpa)
                        for action in workload_actions)
@@ -287,48 +285,90 @@ class WorkloadManager:
             self.usage_queue.cancel_join_thread()
             self.usage_queue.close()
 
-    def wait_pods_ready(self, pods_before_setup: int = 0):
-        """
-        Waits until the number of currently running pods matches the expected number of pods.
+    def setup_owners(self):
+        """Final replica counts for the generator's namespace/deployment label."""
+        owners = {}
+        for namespace, objects in self.data['setup']['applied_objects'].items():
+            for obj in objects:
+                if obj.get('kind', '').lower() in {'deployment', 'statefulset'}:
+                    owner = obj.get('spec', {}).get('template', {}).get('metadata', {}).get(
+                        'labels', {}).get('deployment', obj['metadata']['name'])
+                    owners[(namespace, owner)] = obj.get('spec', {}).get('replicas', 1)
+        return owners
 
-        This method calculates the expected number of pods based on the deployment specifications
-        defined in the `self.data` dictionary. It then continuously checks the current number of
-        running pods (excluding specific namespaces) and logs the progress until the expected
-        number of pods is reached.
+    def owned_pods(self, pods):
+        grouped = {key: [] for key in self.expected_owners}
+        for pod in pods:
+            key = (pod.metadata.namespace, (pod.metadata.labels or {}).get('deployment'))
+            if key in grouped:
+                identity = (pod.metadata.namespace, pod.metadata.name)
+                if identity in self.pods_before_setup:
+                    raise RuntimeError(f'Pre-existing workload pod cannot seed setup: {identity}')
+                grouped[key].append(pod)
+        return grouped
 
-        The method uses a 2-second interval between checks to avoid excessive polling.
-        """
-        expected_pods = 0
-            
-        for namespace_objects in self.data['setup']['applied_objects'].values():
-            for obj in namespace_objects:
-                kind = obj.get("kind", "").lower()
-                replica_count = obj.get("spec", {}).get("replicas", 0)
-
-                if kind in {"deployment", "statefulset"}:
-                    expected_pods += replica_count
-                elif replica_count:
-                    self.log(f"[WARNING] Object is not a Deployment or StatefulSet but has replicas={replica_count}. Counting it as workload.")
-                    expected_pods += replica_count
-
-        setup_progress(self, 'workloads_converge', expected=expected_pods)
-        target_namespaces = set(self.data['setup']['applied_objects'].keys())
-        
-        # Almost 7 pods are created per second, the timeout is derived from expected pod count.
-        deadline = time.monotonic() + int(expected_pods / 7)
+    def wait_pods_created(self):
+        """Pending custom-scheduler pods are valid here; no bind is required yet."""
+        deadline = time.monotonic() + self.CREATION_TIMEOUT
+        expected = sum(self.expected_owners.values())
+        setup_progress(self, 'workloads_converge', expected=expected)
+        pending = dict(self.expected_owners)
         while True:
-            current_pods = self.count_pods_in_namespaces(target_namespaces) - pods_before_setup
-            setup_progress(self, 'workloads_converge', completed=current_pods)
-            if current_pods >= expected_pods:
-                self.log(f"[INFO] All pods created. Current: {current_pods}, Expected: {expected_pods}")
-                break
-            if time.monotonic() >= deadline:
-                if getattr(self, 'report', None) is not None:
-                    self.report.end_phase('workloads_converge', result='timed_out')
-                self.log(f"[WARNING] Timeout waiting for pods. Current: {current_pods}, Expected: {expected_pods}. Proceeding anyway.")
-                break
-            self.log(f"[INFO] Current pods: {current_pods}, Expected: {expected_pods}")
-            time.sleep(2)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'Pods not created within real setup deadline: {pending}')
+            grouped = self.owned_pods(self.k8s_api.list_pod_for_all_namespaces(
+                _request_timeout=min(10, remaining)).items)
+            pending = {key: {'expected': count, 'observed': len(grouped[key])}
+                       for key, count in self.expected_owners.items() if len(grouped[key]) != count}
+            setup_progress(self, 'workloads_converge', completed=sum(len(pods) for pods in grouped.values()))
+            if not pending:
+                self.created_pods = {(pod.metadata.namespace, pod.metadata.name): pod.metadata.uid
+                                     for pods in grouped.values() for pod in pods}
+                return
+            excess = {key: value for key, value in pending.items() if value['observed'] > value['expected']}
+            if excess:
+                raise RuntimeError(f'Excess workload pods: {excess}')
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    def wait_pods_operational(self, mapping_path=PodsMapping.PODS_AND_NODES_PATH):
+        """Confirm the same pods on their mapped nodes and KWOK Running/Ready."""
+        with open(mapping_path, newline='') as source:
+            rows = list(csv.DictReader(source))
+        destinations = {(row['namespace'], row['pod']): row['node'] for row in rows}
+        if len(destinations) != len(rows) or set(destinations) != set(self.created_pods):
+            raise RuntimeError('Initial placement differs from created workload pods')
+        deadline = time.monotonic() + self.SCHEDULING_TIMEOUT
+        pending = sorted(destinations)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'Pods not operational within real scheduling deadline: {pending}')
+            grouped = self.owned_pods(self.k8s_api.list_pod_for_all_namespaces(
+                _request_timeout=min(10, remaining)).items)
+            pods = {(pod.metadata.namespace, pod.metadata.name): pod
+                    for entries in grouped.values() for pod in entries}
+            if set(pods) - set(destinations):
+                raise RuntimeError(f'Unexpected workload pods after binds: {sorted(set(pods) - set(destinations))}')
+            pending = []
+            for key, node in destinations.items():
+                pod = pods.get(key)
+                if pod is None:
+                    pending.append(key)
+                    continue
+                if pod.metadata.uid != self.created_pods[key]:
+                    raise RuntimeError(f'Workload pod replaced during setup: {key}')
+                if pod.spec.node_name and pod.spec.node_name != node:
+                    raise RuntimeError(f'Incorrect initial destination for {key}: {pod.spec.node_name}, expected {node}')
+                ready = pod.status and pod.status.phase == 'Running' and any(
+                    condition.type == 'Ready' and condition.status == 'True'
+                    for condition in (pod.status.conditions or []))
+                if pod.spec.node_name != node or not ready or pod.metadata.deletion_timestamp:
+                    pending.append(key)
+            setup_progress(self, 'pods_operational', expected=len(destinations), completed=len(destinations) - len(pending))
+            if not pending:
+                return
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
 
     def namespace_exists(self, namespace):
         """

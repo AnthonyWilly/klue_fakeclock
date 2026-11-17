@@ -111,7 +111,9 @@ Use static infrastructure and/or workload:
 #### Replay speed
 
 Use `--speed-factor F` to scale trace replay deadlines, the final 15-second
-logical observation tail, and workload usage reconciliation. The default is
+logical observation tail, and workload usage reconciliation. It also sets setup
+application capacity to `min(8, ceil(F))` independent workers, with serial order
+for repeated operations on the same namespace/kind/name. The default is
 `1`; finite fractional factors are supported when both scrape intervals can be
 represented in whole milliseconds. For example, `1.5` and `8` are supported,
 whereas `7` is rejected before setup. Acceleration requires emulation
@@ -127,7 +129,20 @@ Infrastructure and workload share an origin established after preparation and
 Prometheus port-forward and sampling readiness. Overdue events run in input order without
 changing the requested factor or shifting later deadlines. Static modes still
 wait through the trace duration. API, readiness and cleanup timeouts remain in
-real seconds; preparation and total runtime need not accelerate proportionally.
+real seconds. Independent node and workload applications use the same bounded
+worker policy as binds. Namespaces precede their objects; all application failures
+reach the coordinator. KWOK worker settings, client QPS/burst and the four usage
+writes per event remain unchanged. Setup capacity is a limit, not a promised
+speedup: preparation and total runtime need not accelerate proportionally.
+
+Creation waits up to 600 real seconds for the exact expected fake node identities
+and another 600 for new pods with the expected namespace/workload-owner coverage.
+Extra fake nodes or excess/old workload pods fail setup; unrelated workloads and
+real nodes cannot satisfy these barriers. Pending pods may pass creation before
+custom scheduling. After binds, the same pods must reach their mapped destinations
+and KWOK Running/Ready within 600 real seconds. These limits are never divided by
+F; timeout stops preparation with the missing resources recorded. Usage must be
+acknowledged and metrics readiness confirmed before the shared replay origin.
 
 Initial placement matches pods by namespace and workload owner, validates full
 allocation coverage, and confirms each mapped `spec.nodeName` through a shared
@@ -222,13 +237,14 @@ convergence, initial usage submission, mapping, scheduler build/binds,
 port-forward, metrics readiness, usage acknowledgements, final collection,
 teardown and compression. Parent durations include their children; compare
 siblings or top-level phases, without summing parents and children. Setup and
-bind concurrency are currently 1 at every factor; usage pod-write concurrency
-remains separately reported. Application counts measure successful calls,
+bind concurrency are `min(8, ceil(F))`, recorded in `configuration` and application
+phases; usage pod-write concurrency remains separately reported. Application
+counts measure successful calls,
 `initial_usage` counts submissions/scales, and `initial_usage_drain` counts worker
-acknowledgements. Convergence counts retain the existing observed node/pod policy;
-a pod-count timeout is recorded as `timed_out` even when setup proceeds. Failure
-and interruption retain partial counts and elapsed time. These diagnostics do
-not change readiness policy or prove correct pod placement.
+acknowledgements. Convergence counts cover the expected identities; creation or
+operational readiness timeout fails preparation. Failure and interruption retain
+partial counts and elapsed time. Local structural checks do not prove performance
+or metric fidelity: both require controlled paired runs and curve inspection.
 
 The archive phase uses `recorded_before_close`: its final snapshot includes CSV
 compression but precedes writing `run.json` into the ZIP and closing the archive.

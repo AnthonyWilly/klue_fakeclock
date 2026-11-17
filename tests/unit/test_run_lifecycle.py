@@ -477,35 +477,33 @@ def test_unstarted_collection_absent_after_setup_interruption(lifecycle):
     assert 'metrics_ready' not in report.data['phases']
 
 
-def test_setup_records_application_progress_and_existing_pod_timeout(tmp_path, monkeypatch):
-    import workload.manager as workload_module
-    report = RunReport(tmp_path / 'out', monotonic=lambda: 50)
+def test_setup_creation_timeout_stops_before_usage(tmp_path):
+    report = RunReport(tmp_path / 'out')
     parent = WorkloadManager.__new__(WorkloadManager)
     parent.report = report
     parent.hpa = False
     parent.BEFORE_EMULATION_KINDS = {'horizontalpodautoscaler'}
     parent.usage_manager = Mock()
+    parent.k8s_api = Mock()
+    parent.k8s_api.list_pod_for_all_namespaces.return_value.items = []
     parent.k8s_object_applier = Mock()
     parent.create_namespace_if_not_exists = Mock()
-    parent.count_pods_in_namespaces = Mock(return_value=0)
-    parent.set_workload_usage = Mock(side_effect=[None, RuntimeError('usage enqueue failed')])
+    parent.set_workload_usage = Mock()
+    parent.CREATION_TIMEOUT = 0
     parent.data = {'setup': {'applied_objects': {'ns': [
-        {'kind': 'Deployment', 'spec': {'replicas': 14}},
-        {'kind': 'ConfigMap'}, {'kind': 'HorizontalPodAutoscaler'}]},
-        'workload_actions': [{'action': 'set-usage'}, {'action': 'set-usage'}]}}
-    times = iter([10, 13])
-    monkeypatch.setattr(workload_module.time, 'monotonic', lambda: next(times))
-    with pytest.raises(RuntimeError, match='usage enqueue failed'):
+        {'kind': 'Deployment', 'metadata': {'namespace': 'ns', 'name': 'app'}, 'spec': {'replicas': 14}},
+        {'kind': 'HorizontalPodAutoscaler'}]},
+        'workload_actions': [{'action': 'set-usage'}]}}
+    with pytest.raises(TimeoutError, match='app'):
         parent.setup()
     phases = report.data['phases']
-    assert phases['workloads_apply']['expected'] == 2
-    assert phases['workloads_apply']['completed'] == 2
+    assert phases['workloads_apply']['expected'] == 1
+    assert phases['workloads_apply']['completed'] == 1
     assert phases['workloads_apply']['concurrency'] == 1
-    assert phases['workloads_converge']['result'] == 'timed_out'
+    assert phases['workloads_converge']['result'] == 'failed'
     assert phases['workloads_converge']['expected'] == 14
-    assert phases['workloads_converge']['completed'] == 0
-    assert phases['initial_usage']['completed'] == 1
-    assert phases['initial_usage']['failed'] == 1
+    assert 'initial_usage' not in phases
+    parent.set_workload_usage.assert_not_called()
     parent.create_namespace_if_not_exists.assert_called_once_with('ns')
 
 
@@ -592,3 +590,39 @@ def test_initial_placement_failure_never_starts_replay(lifecycle, monkeypatch, f
     assert report.data['phases']['preparation']['result'] == 'failed'
     if failure == 'mapping':
         popen.assert_not_called()
+
+
+@pytest.mark.parametrize('barrier', ['creation', 'operational', 'usage', 'metrics'])
+def test_setup_barrier_failure_keeps_origin_unset_and_cleans_up(lifecycle, barrier):
+    result, report, _ = lifecycle
+    if barrier == 'creation':
+        result.workload_manager.setup.side_effect = TimeoutError('missing creation owner ns/app')
+    elif barrier == 'operational':
+        result.workload_manager.wait_pods_operational.side_effect = TimeoutError('pod ns/p not Ready')
+    elif barrier == 'usage':
+        result.workload_manager.usage_progress.update(failed=1, completed=2)
+    else:
+        result.prepare_observability.side_effect = TimeoutError('metrics freshness')
+    with pytest.raises(RuntimeError, match='failed'):
+        result.run()
+    assert result.clock.origin_monotonic is None
+    assert result.clock.origin_unix is None
+    result.workload_manager.emulation.assert_not_called()
+    result.infrastructure_manager.emulation.assert_not_called()
+    result.workload_manager.tear_down.assert_called_once()
+    result.service_monitor_manager.stop.assert_called_once()
+
+
+def test_origin_waits_for_operational_usage_and_metrics_confirmations(lifecycle):
+    result, _, _ = lifecycle
+    confirmations = []
+    def confirm(kind):
+        assert result.clock.origin_monotonic is None
+        assert result.clock.origin_unix is None
+        confirmations.append(kind)
+    result.workload_manager.wait_pods_operational.side_effect = lambda: confirm('pods')
+    result.workload_manager.drain_usage.side_effect = lambda **kwargs: confirm('usage') if result.clock.origin_monotonic is None else None
+    result.prepare_observability.side_effect = lambda: confirm('metrics')
+    result.run()
+    assert confirmations == ['pods', 'metrics', 'usage']
+    assert result.clock.origin_monotonic is not None

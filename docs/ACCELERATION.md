@@ -211,3 +211,50 @@ Compare repeated runs for lag, errors, machine resource usage, effective factor,
 phase durations and the same visual curves. Record requested and installed
 worker counts from `run.json`. Recommend worker values only after measurements;
 additional workers are a capacity hypothesis, not a guaranteed speedup.
+
+
+## Setup capacity and end-to-end acceptance
+
+The factor also selects `min(8, ceil(F))` setup application and bind workers
+(one at 1×, two at 1.5×/2×, five at 5×). Independent resources can overlap;
+operations on one namespace/kind/name remain serial with isolated object bodies.
+Namespaces precede applications, fake nodes precede binds, and all parallel
+results are joined. Errors stop preparation. This does not change KWOK workers,
+client QPS/burst, usage distribution or FIFO event order; the usage pool still
+allows four pod writes within one event and acknowledges completion.
+
+Setup identifies fake nodes explicitly, ignoring real-node counts and rejecting
+extra fake nodes. NodeClaims resolve their destination via `status.nodeName`.
+Pod creation requires exact per-namespace/workload-owner coverage, using the
+`deployment` label produced by the trace generator. Pre-existing workload pods
+cannot satisfy creation. Other owners/namespaces cannot fill missing coverage.
+Creation accepts Pending pods before custom binds. Afterwards the same pod UIDs
+must appear on the mapped nodes, Running with a True Ready condition, before
+replay. Setup uses 600-real-second global deadlines for node convergence, pod
+creation and post-bind operational readiness, with bounded API requests. They
+are not scaled by F or used as target durations; expiry fails with pending
+identities. These are initial limits whose sufficiency needs reference-machine
+validation. Usage acknowledgements and existing metrics freshness/readiness
+remain required before establishing the common origin.
+
+Evaluate total command wall time through the closed ZIP, not just replay or
+`timing.total_real` (which is recorded before archive closure). Use at least
+three paired 1×/2× runs with alternating order, the same candidate revision,
+trace, machine, modes, versions and clean initial state. Separate cold install
+from already-installed preparation. Record medians, dispersion and the dominant
+setup/replay/finalization stages, backlog, input/image identities, collection
+coverage and logical grid counts. The experimental total-time target is
+`median(T2) / median(T1) <= 0.55`, with no material candidate-1× regression
+against the approved reference. It is not a replay-factor guarantee.
+
+Accept duration and fidelity together: inspect candidate 1× against the approved
+reference, then candidate 2× against candidate 1×, using the comparison views
+above with a common origin, identical logical buckets and no interpolation.
+Check initial transitions, aggregate pods, CPU, memory and individual curves.
+Keep raw counters/CSVs unchanged; shorter setup changes their initial history.
+There is no numerical fidelity tolerance implied by the 10% timing margin.
+A faster setup or passing unit tests alone does not establish the total target.
+If API/KWOK capacity or replay backlog prevents it, report the remaining budget
+and bottleneck without shortening convergence waits, dropping events or
+relaxing collection freshness. Store plots and the manual acceptance separately
+from `run.json`.

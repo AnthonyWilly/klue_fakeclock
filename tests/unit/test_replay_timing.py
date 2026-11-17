@@ -202,7 +202,7 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
         def prepare():
             assert clock.origin_monotonic is None
             time.wait(3)
-        for method in ('before_setup', 'setup', 'before_emulation', 'start', 'run'):
+        for method in ('before_setup', 'setup', 'wait_pods_operational', 'before_emulation', 'start', 'run'):
             getattr(obj, method).side_effect = prepare
         components[name] = obj
         return obj
@@ -237,6 +237,8 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
         (tmp_path / name).write_text('{}')
     coordinator.PodsMapping.PODS_ALLOCATION_PATH = str(tmp_path / 'pods_allocation.csv')
     instance = coordinator.Manager(data_path=tmp_path, karpenter=False, hpa=False, speed_factor=2, report=report)
+    assert report.data['configuration']['setup_concurrency'] == 2
+    assert report.data['configuration']['bind_concurrency'] == 2
     instance.collection_diagnostics['complete'] = True
     def prepare_observability():
         assert clock.origin_monotonic is None
@@ -259,7 +261,8 @@ def test_setup_omits_hpa_without_forwarding_to_applier():
     workload.data['setup'] = {'applied_objects': {'ns': [hpa, obj]}, 'workload_actions': []}
     workload.usage_manager = Mock()
     workload.count_pods_in_namespaces = Mock(return_value=0)
-    workload.wait_pods_ready = Mock()
+    workload.k8s_api.list_pod_for_all_namespaces.return_value.items = []
+    workload.wait_pods_created = Mock()
     workload.setup()
     workload.k8s_object_applier.apply_object.assert_called_once_with(obj)
 

@@ -3,6 +3,7 @@ This module defines the InfrastructureManager class, which manages the setup, em
 for trace-driven experiments. It handles applying Kubernetes objects, managing node pools, and coordinating emulation phases.
 """
 
+from setup_execution import apply_independent, setup_workers
 from run_report import setup_phase, setup_progress
 import json
 import time
@@ -12,13 +13,14 @@ from util.k8s_object_applier import KubernetesObjectApplier
 
 class InfrastructureManager:
     TIME_OUT = 200
-    AMOUNT_OF_REAL_NODES = 1
+    SETUP_TIMEOUT = 600
 
     def __init__(self, data_path, karpenter, emulation_phase, speed_factor=1):
         """
         Initializes the Manager class.
         """
         self.speed_factor = validate_speed_factor(speed_factor, karpenter=karpenter)
+        self.setup_concurrency = setup_workers(self.speed_factor)
         self.karpenter = karpenter
         self.emulation_phase = emulation_phase
 
@@ -44,32 +46,52 @@ class InfrastructureManager:
             self.expand_nodepools_disruption_time()
 
     def setup(self):
-        """
-        Executes the infrastructure setup process.
-
-        This method applies initial infrastructure configurations from
-        `self.data['setup']` to the Kubernetes cluster. These configurations
-        are typically expected to be items like custom Node objects or
-        NodeClaim-like resources. After applying these objects, the method
-        waits until a target number of these managed nodes are observed in
-        the cluster.
-        """
+        """Apply independent resources and confirm expected fake node identities."""
         setup = self.data['setup']
-        with setup_phase(self, 'nodes_apply', parent='nodes', expected=len(setup), concurrency=1, unit='objects'):
-            for index, infra_obj in enumerate(setup):
-                node_name = infra_obj["metadata"]["name"]
-                self.k8s_object_applier.apply_object(infra_obj)
-                setup_progress(self, 'nodes_apply', completed=index + 1)
-                self.log(f"[INFO] Node {node_name} applied.")
+        workers = getattr(self, 'setup_concurrency', 1)
+        with setup_phase(self, 'nodes_apply', parent='nodes', expected=len(setup), concurrency=workers, unit='objects'):
+            apply_independent(setup, self.k8s_object_applier.apply_object, workers,
+                              lambda count: setup_progress(self, 'nodes_apply', completed=count))
 
-        with setup_phase(self, 'nodes_converge', parent='nodes', expected=self.input_data_node_count, unit='observed_nodes'):
-            while self.input_data_node_count != self.node_count:
-                nodes = self.k8s_api.list_node()
-                print(f"[INFO] Waiting for nodes to be created. Expected: {self.input_data_node_count}, Current: {len(nodes.items) - self.AMOUNT_OF_REAL_NODES}")
-                self.node_count = len(nodes.items) - self.AMOUNT_OF_REAL_NODES
+        expected = {obj['metadata']['name'] for obj in setup}
+        claim_names = {obj['metadata']['name'] for obj in setup
+                       if obj.get('kind', '').lower() == 'nodeclaim'}
+        missing = expected.copy()
+        deadline = time.monotonic() + self.SETUP_TIMEOUT
+        with setup_phase(self, 'nodes_converge', parent='nodes', expected=len(expected), unit='observed_nodes'):
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f'Nodes not created within real setup deadline: {sorted(missing)}')
+                nodes = self.k8s_api.list_node(_request_timeout=min(10, remaining)).items
+                claims = {}
+                unresolved = set()
+                for name in sorted(claim_names):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f'Nodes not created within real setup deadline: {sorted(missing)}')
+                    claim = self.k8s_api.get_cluster_custom_object(
+                        'karpenter.sh', 'v1', 'nodeclaims', name,
+                        _request_timeout=min(10, remaining))
+                    node_name = claim.get('status', {}).get('nodeName')
+                    if node_name:
+                        claims[node_name] = name
+                    else:
+                        unresolved.add(name)
+                observed = set()
+                for node in nodes:
+                    if (node.metadata.annotations or {}).get('kwok.x-k8s.io/node') != 'fake':
+                        continue
+                    observed.add(claims.get(node.metadata.name, node.metadata.name))
+                extra = observed - expected
+                if extra and not unresolved:
+                    raise RuntimeError(f'Unexpected fake nodes during setup: {sorted(extra)}')
+                missing = (expected - observed) | unresolved
+                self.node_count = len(expected - missing)
                 setup_progress(self, 'nodes_converge', completed=self.node_count)
-                self.log(f"[INFO] Node count: {self.node_count}")
-                time.sleep(2)
+                if not missing:
+                    return
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
 
     def before_emulation(self):
         """

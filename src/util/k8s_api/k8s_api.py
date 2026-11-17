@@ -5,19 +5,27 @@ custom resources, allowing for streamlined Kubernetes resource operations.
 """
 from kubernetes import client, config
 
+class TimedApiClient(client.ApiClient):
+    """Supply a real request timeout, including generated calls passing None."""
+    def __init__(self, configuration, timeout):
+        super().__init__(configuration=configuration)
+        self.request_timeout = timeout
+
+    def call_api(self, *args, **kwargs):
+        if kwargs.get('_request_timeout') is None:
+            kwargs['_request_timeout'] = self.request_timeout
+        return super().call_api(*args, **kwargs)
+
+
 class K8SAPI:
     def __init__(self, timeout=120):
-        config.load_kube_config()
-        
-        # Get the default AWS configuration and set the timeout of a request
-        configuration = client.Configuration.get_default_copy()
-        configuration.timeout_seconds = timeout
-        client.Configuration.set_default(configuration)
-
-        self.v1 = client.CoreV1Api()
-        self.apps_v1 = client.AppsV1Api()
-        self.custom_api = client.CustomObjectsApi()
-        self.autoscaling_v2 = client.AutoscalingV2Api()
+        configuration = client.Configuration()
+        config.load_kube_config(client_configuration=configuration)
+        api_client = TimedApiClient(configuration, timeout)
+        self.v1 = client.CoreV1Api(api_client)
+        self.apps_v1 = client.AppsV1Api(api_client)
+        self.custom_api = client.CustomObjectsApi(api_client)
+        self.autoscaling_v2 = client.AutoscalingV2Api(api_client)
 
     def log(self, message):
         print(f"[K8SAPI] {message}")
@@ -49,10 +57,10 @@ class K8SAPI:
     def list_pod_for_all_namespaces(self, **kwargs):
         return self.v1.list_pod_for_all_namespaces(**kwargs)
     
-    def list_namespaced_pod(self, namespace, label_selector=None):
+    def list_namespaced_pod(self, namespace, label_selector=None, **kwargs):
         return self.v1.list_namespaced_pod(
             namespace=namespace,
-            label_selector=label_selector
+            label_selector=label_selector, **kwargs
         )
 
     # Deployments

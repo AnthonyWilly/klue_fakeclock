@@ -5,7 +5,7 @@ nodeclaims, and other resources, while also handling custom logic for scaling an
 """
 
 import subprocess
-import math
+from setup_execution import setup_workers
 import os
 import signal
 import time
@@ -56,7 +56,7 @@ class Manager:
         self.report.update(configuration=dict(self.report.data['configuration'], karpenter=karpenter, hpa=hpa,
             infrastructure=infrastructure, workload=workload, speed_factor=self.speed_factor,
             requested_intervals=self.intervals.snapshot(), requested_workers=self.workers_override,
-            setup_concurrency=1, bind_concurrency=1))
+            setup_concurrency=setup_workers(self.speed_factor), bind_concurrency=setup_workers(self.speed_factor)))
         for name in ('infrastructure_description.json', 'workload_description.json'):
             self.report.trace(Path(data_path) / name, 'replay')
         self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure, speed_factor=self.speed_factor)
@@ -85,7 +85,7 @@ class Manager:
         """
         with self.report.phase('mapping', parent='preparation', concurrency=1):
             self.pods_mapping.run()
-        workers = min(8, math.ceil(self.speed_factor))
+        workers = setup_workers(self.speed_factor)
         self.report.update(configuration=dict(self.report.data['configuration'], bind_concurrency=workers))
         with self.report.phase('scheduler_build_binds', parent='preparation', concurrency=workers):
             process = subprocess.Popen(
@@ -307,6 +307,8 @@ class Manager:
                 with report.phase('workloads', parent='preparation', concurrency=1):
                     self.workload_manager.setup()
                 self.start_mapping_and_scheduler()
+                with report.phase('pods_operational', parent='preparation', concurrency=1):
+                    self.workload_manager.wait_pods_operational()
                 with report.phase('before_emulation', parent='preparation', concurrency=1):
                     self.workload_manager.before_emulation()
                     self.infrastructure_manager.before_emulation()
@@ -320,6 +322,8 @@ class Manager:
                     self.workload_manager.check_usage()
                     try:
                         self.workload_manager.drain_usage(check=check_threads)
+                        if self.workload_manager.usage_progress['failed'] or self.workload_manager.usage_progress['errors']:
+                            raise RuntimeError('Initial usage reconciliation failed')
                     finally:
                         progress = self.workload_manager.usage_progress
                         report.phase_progress('initial_usage_drain', expected=progress['enqueued'],
