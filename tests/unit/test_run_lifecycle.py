@@ -564,3 +564,31 @@ while true; do sleep .05; done
         if process.poll() is None:
             process.kill()
             process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize('failure', ['mapping', 'scheduler'])
+def test_initial_placement_failure_never_starts_replay(lifecycle, monkeypatch, failure):
+    result, report, _ = lifecycle
+    result.start_mapping_and_scheduler = coordinator.Manager.start_mapping_and_scheduler.__get__(result)
+    result.pods_mapping = Mock()
+    popen = Mock()
+    monkeypatch.setattr(coordinator.subprocess, 'Popen', popen)
+    if failure == 'mapping':
+        result.pods_mapping.run.side_effect = ValueError('incomplete allocation')
+    else:
+        process = Mock(pid=12345, args=['scheduler'])
+        process.wait.return_value = 23
+        popen.return_value = process
+        monkeypatch.setattr(coordinator.os, 'killpg', Mock())
+    with pytest.raises(RuntimeError, match='failed'):
+        result.run()
+    assert result.clock.origin_monotonic is None
+    assert result.clock.origin_unix is None
+    result.infrastructure_manager.emulation.assert_not_called()
+    result.workload_manager.emulation.assert_not_called()
+    result.prepare_observability.assert_not_called()
+    result.workload_manager.tear_down.assert_called_once()
+    assert report.data['status'] == 'failed'
+    assert report.data['phases']['preparation']['result'] == 'failed'
+    if failure == 'mapping':
+        popen.assert_not_called()

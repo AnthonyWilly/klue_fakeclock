@@ -1,219 +1,125 @@
-"""
-PodsMapping is a class responsible for mapping Kubernetes pods to nodes in a cluster. 
-It provides functionality to fetch cluster nodes, map fake nodes to real nodes, and 
-associate pods with their respective nodes. The class interacts with the Kubernetes 
-API and processes data to generate mappings that can be used for emulation purposes.
-"""
+"""Build a complete, deterministic initial pod placement from the allocation."""
+import os
+import tempfile
+
 import pandas as pd
 from util.k8s_api.k8s_api import K8SAPI
 
+
 class PodsMapping:
-    """
-    A class to handle the mapping of Kubernetes pods to nodes for emulation purposes.
-    This class provides functionality to map fake nodes to real nodes, associate pods with their owners,
-    and generate mappings between emulation pods and real nodes. It interacts with the Kubernetes API
-    to fetch information about nodes and pods and uses a CSV file to store and update the pods allocation.
-    """
-    PODS_ALLOCATION_PATH = "/tmp/pods_allocation.csv"
+    PODS_ALLOCATION_PATH = '/tmp/pods_allocation.csv'
+    PODS_AND_NODES_PATH = '/tmp/pods_and_nodes_map.csv'
 
     def __init__(self, karpenter):
-        """
-        Initializes the PodsMapping class.
-
-        This constructor sets up the Kubernetes API client by creating an instance
-        of the K8SAPI class and assigning it to the `k8s_api` attribute.
-        """
         self.k8s_api = K8SAPI()
         self.karpenter = karpenter
 
     def log(self, message):
-        """
-        Logs a message with a specific prefix indicating the context of the log.
-        """
-        print(f"[PODS MAPPING] {message}")
+        print(f'[PODS MAPPING] {message}')
 
     def get_fake_nodes_dict(self):
-        """
-        Retrieves a dictionary of fake nodes in the Kubernetes cluster, grouped by their instance type.
-
-        This method fetches the list of nodes in the cluster and filters out real nodes based on a regex pattern.
-        It organizes the remaining fake nodes into a dictionary where the keys are instance types, and the values
-        are lists of fake nodes with their corresponding node names and node pools.
-        """
-        self.log("[INFO] Fetching cluster nodes with node pool and instance type.")
-        self.log("[INFO] This may take a while, please wait...")
-
         node_data = {}
-
-        nodes = self.k8s_api.list_node()
-
-        for node in nodes.items:
-            node_name = node.metadata.name
-            instance_type = node.metadata.labels.get('node.kubernetes.io/instance-type')
-
-            if instance_type not in node_data:
-                node_data[instance_type] = []
-
-            node_pool = "none"
-            if self.karpenter:
-                node_pool = node.metadata.labels.get('karpenter.sh/nodepool')
-
-            if node.metadata.annotations.get("kwok.x-k8s.io/node") == "fake":
-                node_data[instance_type].append([node_name, node_pool])
-
+        seen = set()
+        for node in self.k8s_api.list_node().items:
+            if (node.metadata.annotations or {}).get('kwok.x-k8s.io/node') != 'fake':
+                continue
+            name = node.metadata.name
+            labels = node.metadata.labels or {}
+            instance_type = labels.get('node.kubernetes.io/instance-type')
+            pool = labels.get('karpenter.sh/nodepool') if self.karpenter else 'none'
+            if not name or not instance_type or not pool or name in seen:
+                raise ValueError(f'Invalid or duplicate fake node: {name}')
+            seen.add(name)
+            node_data.setdefault(instance_type, []).append([name, pool])
+        for nodes in node_data.values():
+            nodes.sort()
         return node_data
 
     def get_real_nodes_dict(self):
-        """
-        Generates a dictionary that maps instance types to their corresponding nodes and node pools.
-
-        This method processes the `pods_allocation` DataFrame to extract unique combinations of 
-        nodes, node pools, and instance types. It then organizes this data into a dictionary 
-        where the keys are instance types, and the values are lists of [node_name, node_pool] pairs.
-        """
-        unique_nodes = pd.DataFrame()
-        if self.karpenter:
-            unique_nodes = self.pods_allocation[["node", "nodepool", "instance_type"]].drop_duplicates()
-        else:
-            unique_nodes = self.pods_allocation[["node", "instance_type"]].drop_duplicates()
-
+        columns = ['node', 'instance_type'] + (['nodepool'] if self.karpenter else [])
+        unique = self.pods_allocation[columns].drop_duplicates()
+        if unique['node'].duplicated().any():
+            raise ValueError('Conflicting instance type or nodepool for allocation node')
         node_data = {}
-
-        for _, row in unique_nodes.iterrows():
-            node_name = row["node"]
-            instance_type = row["instance_type"]
-
-            node_pool = "none"
-            if self.karpenter:
-                node_pool = row["nodepool"]
-            if instance_type not in node_data:
-                node_data[instance_type] = []
-            node_data[instance_type].append([node_name, node_pool])
-
+        for _, row in unique.iterrows():
+            pool = row['nodepool'] if self.karpenter else 'none'
+            node_data.setdefault(row['instance_type'], []).append([row['node'], pool])
         return node_data
 
-
     def get_owners_with_pods(self):
-        """
-        Retrieves a mapping of Kubernetes deployment owners to their associated pods.
-
-        This method queries all pods across all namespaces in the Kubernetes cluster
-        and organizes them by their deployment owner, as specified in the pod's metadata labels.
-        """
-        owners_with_pods = {}
-
-        pods = self.k8s_api.list_pod_for_all_namespaces()
-
-        for pod in pods.items:
-            owner_name = pod.metadata.labels.get('deployment')
-
-            if owner_name:
-                if owner_name not in owners_with_pods:
-                    owners_with_pods[owner_name] = []
-                owners_with_pods[owner_name].append(pod.metadata.name)
-
-        return owners_with_pods
+        owners = {}
+        for pod in self.k8s_api.list_pod_for_all_namespaces().items:
+            owner = (pod.metadata.labels or {}).get('deployment')
+            if owner:
+                key = (pod.metadata.namespace, owner)
+                owners.setdefault(key, []).append(pod.metadata.name)
+        return {key: sorted(names) for key, names in owners.items()}
 
     def map_fake_and_real_nodes(self, fake_nodes_dict, real_nodes_dict):
-        """
-        1:1 mapping consuming both lists (real → fake), no round robin.
-        """
-
-        self.log("[INFO] Mapping fake nodes to real nodes (1:1).")
-
-        self.pods_allocation.to_csv("/tmp/pods_allocation_before_node_map.csv", index=False)
-
         node_mapping = {}
-
         for instance_type, real_nodes in real_nodes_dict.items():
+            available = list(fake_nodes_dict.get(instance_type, []))
+            for real_name, pool in real_nodes:
+                match = next((node for node in available if node[1] == pool), None)
+                if match is None:
+                    raise ValueError(f'No fake node for {real_name}, type={instance_type}, nodepool={pool}')
+                node_mapping[real_name] = match[0]
+                available.remove(match)
+        mapped = self.pods_allocation['node'].map(node_mapping)
+        if mapped.isna().any():
+            raise ValueError('Allocation contains unmapped destinations')
+        self.pods_allocation['node'] = mapped
 
-            if instance_type not in fake_nodes_dict:
-                raise RuntimeError(f"[ERROR] Instance type {instance_type} not found.")
-
-            fake_nodes = fake_nodes_dict[instance_type].copy()  # 🔥 importante
-
-            if len(fake_nodes) < len(real_nodes):
-                raise RuntimeError(f"[ERROR] Not enough fake nodes for instance type {instance_type}.")
-
-
-            for real_node in real_nodes:
-
-                real_node_name = real_node[0]
-                real_node_pool = real_node[1]
-
-                match_index = None
-
-                for i, fake_node in enumerate(fake_nodes):
-                    if fake_node[1] == real_node_pool:
-                        match_index = i
-                        break
-
-                if match_index is None:
-                    raise RuntimeError(f"[ERROR] No fake node for {real_node}")
-
-                fake_node_name = fake_nodes[match_index][0]
-
-                node_mapping[real_node_name] = fake_node_name
-
-                fake_nodes.pop(match_index)
-
-        self.pods_allocation["node"] = self.pods_allocation["node"].map(node_mapping)
-
-        self.pods_allocation.to_csv(self.PODS_ALLOCATION_PATH, index=False)
-        self.pods_allocation.to_csv("/tmp/pods_allocation_node_map.csv", index=False)
-
-    def map_pods_and_nodes(self, replicaset_pod_dict):
-        """
-        Maps emulation pods to real nodes based on the provided replicaset-to-pod mapping.
-
-        This method iterates over the `pods_allocation` DataFrame, which contains information
-        about the replicaset, namespace, node, and the number of pods to allocate. For each
-        replicaset, it assigns pods to nodes by using the `replicaset_pod_dict` mapping, which
-        contains lists of pod names for each replicaset.
-
-        The resulting mapping of pods to nodes is saved as a CSV file at `/tmp/pods_and_nodes_map.csv`
-        and returned as a pandas DataFrame.
-        """
-        self.log("[INFO] Mapping emulation pods to real nodes.")
-        result_rows = []
-
+    def map_pods_and_nodes(self, owners_with_pods):
+        expected = self.pods_allocation.groupby(['namespace', 'replicaset'])['pods_count'].sum()
+        available = {}
+        for key, count in expected.items():
+            pods = sorted(owners_with_pods.get(key, []))
+            if len(pods) != count or len(set(pods)) != len(pods):
+                raise ValueError(f'Pod coverage for {key}: expected {count}, found {len(pods)} (must be unique)')
+            available[key] = iter(pods)
+        rows = []
         for _, row in self.pods_allocation.iterrows():
-            replicaset = row['replicaset']
-            pods_count = int(row['pods_count'])
+            key = (row['namespace'], row['replicaset'])
+            for _ in range(row['pods_count']):
+                rows.append(dict(pod=next(available[key]), namespace=row['namespace'], node=row['node']))
+        result = pd.DataFrame(rows, columns=['pod', 'namespace', 'node'])
+        if result[['namespace', 'pod']].duplicated().any():
+            raise ValueError('Pod belongs to more than one allocation owner')
+        return result
 
-            for _ in range(pods_count):
-                if replicaset in replicaset_pod_dict and replicaset_pod_dict[replicaset]:
-                    pod_name = replicaset_pod_dict[replicaset].pop(0)
+    @staticmethod
+    def _publish(frame, path):
+        # Readers must never observe a partial CSV.
+        fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), suffix='.csv')
+        try:
+            with os.fdopen(fd, 'w') as output:
+                frame.to_csv(output, index=False)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
-                    result_rows.append({
-                        "pod": pod_name,
-                        "namespace": row["namespace"],
-                        "node": row["node"]
-                    })
-
-        result_df = pd.DataFrame(result_rows)
-        result_df.to_csv("/tmp/pods_and_nodes_map.csv", index=False)
-        return result_df
-    
     def run(self):
-        """
-        Executes the Pods Mapping process.
-        This method performs the following steps:
-        1. Logs the start of the Pods Mapping process.
-        2. Reads the pods allocation data from a CSV file specified by `PODS_ALLOCATION_PATH`.
-        3. Retrieves dictionaries representing fake and real nodes.
-        4. Maps fake nodes to real nodes using the retrieved dictionaries.
-        5. Retrieves pod owners and their associated pods.
-        6. Maps pods to nodes based on the pod owners.
-        """
-        self.log("[INFO] Starting Pods Mapping.")
-        self.pods_allocation = pd.read_csv(self.PODS_ALLOCATION_PATH)
-        
-        fake_nodes_dict = self.get_fake_nodes_dict()
-        real_nodes_dict = self.get_real_nodes_dict()
-
-        self.map_fake_and_real_nodes(fake_nodes_dict, real_nodes_dict)
-
-        pod_owners = self.get_owners_with_pods()
-
-        self.map_pods_and_nodes(pod_owners)
+        self.log('Building initial placement')
+        self.pods_allocation = pd.read_csv(
+            self.PODS_ALLOCATION_PATH, keep_default_na=False,
+            dtype={field: str for field in ('namespace', 'replicaset', 'node', 'instance_type', 'nodepool')})
+        required = ['namespace', 'replicaset', 'node', 'instance_type', 'pods_count']
+        if self.karpenter:
+            required.append('nodepool')
+        if not set(required).issubset(self.pods_allocation.columns):
+            raise ValueError(f'Allocation requires columns {required}')
+        for column in required:
+            values = self.pods_allocation[column]
+            if values.isna().any() or values.astype(str).str.strip().eq('').any():
+                raise ValueError(f'Empty allocation field: {column}')
+        counts = pd.to_numeric(self.pods_allocation['pods_count'], errors='raise')
+        if ((counts < 0) | (counts % 1 != 0)).any():
+            raise ValueError('pods_count must be a nonnegative integer')
+        self.pods_allocation['pods_count'] = counts.astype(int)
+        self.map_fake_and_real_nodes(self.get_fake_nodes_dict(), self.get_real_nodes_dict())
+        result = self.map_pods_and_nodes(self.get_owners_with_pods())
+        self._publish(self.pods_allocation, self.PODS_ALLOCATION_PATH)
+        self._publish(result, self.PODS_AND_NODES_PATH)
+        return result

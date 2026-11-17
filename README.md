@@ -129,6 +129,15 @@ changing the requested factor or shifting later deadlines. Static modes still
 wait through the trace duration. API, readiness and cleanup timeouts remain in
 real seconds; preparation and total runtime need not accelerate proportionally.
 
+Initial placement matches pods by namespace and workload owner, validates full
+allocation coverage, and confirms each mapped `spec.nodeName` through a shared
+list/watch before continuing. Binds use `min(8, ceil(F))` workers (one at 1×),
+without changing client QPS or burst. The scheduler has a global 600-real-second
+deadline, bounded transient retries and cancellation; an incorrect destination,
+missing pod or permanent bind failure stops preparation. Its binary is rebuilt
+through Go's build cache on every invocation. Default scheduler manifests are
+applied only after all initial destinations are confirmed.
+
 Replay diagnostics are available in memory through each manager's
 `replay_diagnostics.snapshot()`: entry counts, skipped actions, call outcomes,
 real/logical lag and action timing. A successful usage queue delivery does not

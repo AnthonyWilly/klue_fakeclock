@@ -5,6 +5,9 @@ nodeclaims, and other resources, while also handling custom logic for scaling an
 """
 
 import subprocess
+import math
+import os
+import signal
 import time
 from run_report import RunReport
 from pathlib import Path
@@ -82,8 +85,30 @@ class Manager:
         """
         with self.report.phase('mapping', parent='preparation', concurrency=1):
             self.pods_mapping.run()
-        with self.report.phase('scheduler_build_binds', parent='preparation', concurrency=1):
-            subprocess.run(["bash", "src/build-scheduler.sh"], check=True)
+        workers = min(8, math.ceil(self.speed_factor))
+        self.report.update(configuration=dict(self.report.data['configuration'], bind_concurrency=workers))
+        with self.report.phase('scheduler_build_binds', parent='preparation', concurrency=workers):
+            process = subprocess.Popen(
+                ["bash", "src/build-scheduler.sh", str(workers)], start_new_session=True)
+            try:
+                code = process.wait()
+                if code:
+                    raise subprocess.CalledProcessError(code, process.args)
+            except BaseException:
+                # The shell, build and scheduler share this dedicated process group.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
+                raise
 
     def prepare_observability(self):
         api = self.service_monitor_manager.k8s_api

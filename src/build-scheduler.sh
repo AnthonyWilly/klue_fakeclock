@@ -1,63 +1,32 @@
 #!/bin/bash
+set -euo pipefail
 
-PODS_AND_NODES_MAP="/tmp/pods_and_nodes_map.csv"
+PODS_AND_NODES_MAP="${PODS_AND_NODES_MAP:-/tmp/pods_and_nodes_map.csv}"
+[[ -r "$PODS_AND_NODES_MAP" ]] || { echo "[SCHEDULER] Missing mapping: $PODS_AND_NODES_MAP" >&2; exit 1; }
+PODS_AND_NODES_MAP=$(realpath "$PODS_AND_NODES_MAP")
+cd "$(dirname "${BASH_SOURCE[0]}")/custom-k8s-scheduler"
 
-NUM_PODS_TO_SCHEDULE=$(($(wc -l < "$PODS_AND_NODES_MAP") - 1))
-
-INITIAL_PENDING_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Pending --no-headers | wc -l)
-
-DESIRED_PENDING_PODS=$((INITIAL_PENDING_PODS - NUM_PODS_TO_SCHEDULE))
-
-cd ./src/custom-k8s-scheduler
-
-while [ ! -f "$PODS_AND_NODES_MAP" ]; do
-    echo "[SCHEDULER] [INFO] Waiting $PODS_AND_NODES_MAP file be created..."
-    sleep 2
-done
-
-cp "$PODS_AND_NODES_MAP" .
-if [ ! -f ./custom-scheduler ]; then
-	echo "[SCHEDULER] [INFO] Compiling scheduler code"
-	CGO_ENABLED=0 go build -o custom-scheduler .
-else
-    echo "[SCHEDULER] [INFO] Binary already exists. Skipping build."
-fi
-
-./custom-scheduler &
-
-SCHEDULER_PID=$!
-
-echo "[SCHEDULER] [INFO] Scheduler started with PID: $SCHEDULER_PID"
-
-# for each pod in pods_and_nodes_map, check if it's scheduled
-all_initial_pods_scheduled () {
-    while IFS=',' read -r pod namespace	node
-    do
-      # skip empty lines and headers
-      [[ -z "$pod" || -z "$namespace" ]] && continue
-      [[ "$pod" == "pod" && "$namespace" == "namespace" ]] && continue  
-    
-      node_name=$(kubectl -n "$namespace" get pod "$pod" -o jsonpath='{.spec.nodeName}')
-      if [[ -z "$node_name" ]]; then
-          echo "[SCHEDULER] [WARN] $pod has not been scheduled yet."
-          return 1
-      fi
-    done < "$PODS_AND_NODES_MAP"
-    
-    return 0
-}
-
-while true; do
-    if all_initial_pods_scheduled; then
-        echo "[SCHEDULER] [INFO] All initial pending pods have been scheduled. Killing scheduler."
-        kill "$SCHEDULER_PID"
-        break
+# Go's build cache checks source and dependency changes on every invocation.
+CGO_ENABLED=0 go build -o custom-scheduler .
+scheduler_pid=""
+cleanup() {
+    if [[ -n "$scheduler_pid" ]]; then
+        kill -TERM "$scheduler_pid" 2>/dev/null || true
+        # Bound cleanup even if a child ignores TERM.
+        for ((attempt=0; attempt<100; attempt++)); do
+            kill -0 "$scheduler_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        kill -KILL "$scheduler_pid" 2>/dev/null || true
+        wait "$scheduler_pid" 2>/dev/null || true
     fi
-
-    echo "[SCHEDULER] [INFO] Not all initial pods were scheduled. Checking again in 10 seconds..."
-    sleep 10
-done
-
-bash default-script.sh
-
-rm ./pods_and_nodes_map.csv
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+./custom-scheduler --mapping "$PODS_AND_NODES_MAP" --workers "${1:-1}" &
+scheduler_pid=$!
+wait "$scheduler_pid"
+scheduler_pid=""
+# Stop on the first failed apply, and propagate that failure to the coordinator.
+bash -e default-script.sh

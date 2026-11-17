@@ -215,6 +215,10 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
         time.wait(4)
     monkeypatch.setattr(coordinator.subprocess, 'check_output', lambda *a, **k: 'revision')
     monkeypatch.setattr(coordinator.subprocess, 'run', command)
+    def popen(args, **kwargs):
+        command(args, **kwargs)
+        return Mock(wait=Mock(return_value=0))
+    monkeypatch.setattr(coordinator.subprocess, 'Popen', popen)
     class Thread:
         def __init__(self, target, name, args=(), **kwargs):
             self.target, self.name, self.args = target, name, args
