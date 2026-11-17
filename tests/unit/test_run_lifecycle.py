@@ -65,6 +65,7 @@ def lifecycle(tmp_path, monkeypatch):
         return manager
     result.infrastructure_manager = component()
     result.workload_manager = component()
+    result.workload_manager.usage_lock = threading.RLock()
     result.workload_manager.usage_progress = dict(enqueued=3, completed=3, failed=0, pending=0,
         errors=[], stopped=True, late_events=0, max_lag_real=0, max_lag_logical=0,
         total_lag_real=0, total_lag_logical=0, worst_event=None)
@@ -232,6 +233,9 @@ def test_usage_cru_error_is_failed_ack_and_does_not_drop_next_event():
     worker.handle_set_usage_event = Mock(side_effect=[RuntimeError('CRU failed'), None])
     with pytest.raises(RuntimeError, match='CRU example'):
         worker.apply_cru('example', {})
+    activity = statuses.get_nowait()
+    assert activity['kind'] == 'activity'
+    assert activity['stats']['failures'] == 1
     worker.process_events(monotonic=lambda: 12)
     assert statuses.get_nowait()['completed'] is False
     assert statuses.get_nowait()['completed'] is True

@@ -99,7 +99,7 @@ class Collector:
         if missing or not (MEMORY_METRICS & available):
             raise CollectionError(f'required metrics absent: {sorted(missing)}; memory available: {sorted(MEMORY_METRICS & available)}')
 
-    def targets(self, intervals, nodes=()):
+    def targets(self, intervals, nodes=(), allow_empty_kwok=False):
         """Inspect loaded target configuration and completed scrapes, not applied manifests."""
         data = self.api('targets', {'state': 'active'})
         kwok, ksm = [], []
@@ -110,7 +110,15 @@ class Collector:
                 kwok.append(target)
             elif pool == 'serviceMonitor/monitoring/kube-state-metrics/0':
                 ksm.append(target)
-        if not ksm or not kwok or any(not any(f'/metrics/nodes/{node}/' in t['scrapeUrl'] for t in kwok) for node in nodes):
+        if allow_empty_kwok and not nodes:
+            # Removed nodes can leave stale discovered targets briefly. They
+            # must not block export of samples already stored in Prometheus.
+            kwok = []
+        elif nodes:
+            kwok = [t for t in kwok if any(
+                f'/metrics/nodes/{node}/' in t['scrapeUrl'] for node in nodes)]
+        if (not ksm or (not kwok and not allow_empty_kwok)
+                or any(not any(f'/metrics/nodes/{node}/' in t['scrapeUrl'] for t in kwok) for node in nodes)):
             raise CollectionError('required scrape targets are not active')
         for group, interval, key in ((kwok, intervals.kwok, 'kwok'), (ksm, intervals.ksm, 'kube_state_metrics')):
             for target in group:

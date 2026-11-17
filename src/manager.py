@@ -9,6 +9,7 @@ import time
 from run_report import RunReport
 from pathlib import Path
 import queue
+import copy
 from experiment_clock import ExperimentClock, validate_speed_factor
 from pods_mapping import PodsMapping
 from collector import Collector, CollectionCursor, CollectionError
@@ -105,6 +106,37 @@ class Manager:
                 'query': self.collector.step,
                 'reconcile': self.workload_manager.usage_manager.reconcile_interval_seconds})
 
+    def scrape_watermark(self):
+        """Require live targets except for nodes removed by completed replay actions."""
+        if self.infrastructure_manager.karpenter:
+            # Autoscaler-driven lifecycles keep their existing readiness policy.
+            return self.collector.targets(self.intervals)
+        expected = set(self.initial_nodes)
+        actions = self.infrastructure_manager.replay_diagnostics.snapshot()['actions']
+        for action in actions:
+            if not action['completed']:
+                continue
+            context = action['context']
+            if context['action'] == 'apply-node':
+                expected.add(context['name'])
+            elif context['action'] == 'delete-node':
+                expected.discard(context['name'])
+        monitor = self.service_monitor_manager
+        try:
+            live = {node.metadata.name for node in
+                    monitor.k8s_api.v1.list_node(_request_timeout=10).items
+                    if monitor._is_fake_node(node)}
+        except Exception as error:
+            raise CollectionError(f'could not confirm live emulated nodes: {error}') from error
+        missing = expected - live
+        if missing:
+            raise CollectionError(f'emulated nodes disappeared without completed replay deletion: {sorted(missing)}')
+        empty = not live and not expected
+        self.collection_diagnostics['expected_nodes'] = len(expected)
+        self.collection_diagnostics['live_nodes'] = len(live)
+        self.collection_diagnostics['kwok_targets_not_required'] = empty
+        return self.collector.targets(self.intervals, nodes=sorted(live), allow_empty_kwok=empty)
+
     def collect_loop(self, start_time):
         """Export confirmed grid points; stop wakes immediately and flushes the tail."""
         cursor = CollectionCursor(start_time, self.intervals.query)
@@ -118,7 +150,7 @@ class Manager:
                     self.collector.request_deadline = deadline
                 end = self.collection_end if stopping else time.time()
                 try:
-                    confirmed = self.collector.targets(self.intervals)
+                    confirmed = self.scrape_watermark()
                     while True:
                         window = cursor.window(min(end, confirmed))
                         if window is None:
@@ -165,7 +197,8 @@ class Manager:
             if final and data['late_events']:
                 self.report.issue(f"{data['late_events']} late entries; input order preserved",
                                   warning=True, stage='replay', component=name)
-        usage = dict(self.workload_manager.usage_progress)
+        with self.workload_manager.usage_lock:
+            usage = copy.deepcopy(self.workload_manager.usage_progress)
         usage_errors = usage.pop('errors')
         for error in usage_errors if final else ():
             context = {key: value for key, value in error.items() if key not in ('kind', 'message', 'completed')}
@@ -212,6 +245,7 @@ class Manager:
 
         def check_threads():
             nonlocal last_snapshot
+            check_interruption()
             while not thread_errors.empty():
                 name, error = thread_errors.get_nowait()
                 report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay')
@@ -224,6 +258,10 @@ class Manager:
                 last_snapshot = now
             if self.collection_error:
                 raise RuntimeError('required collection failed; see collection diagnostics')
+
+        def check_interruption():
+            if report.interruption_requested:
+                raise KeyboardInterrupt('interruption requested during final collection')
 
         try:
             report.stage('preparation')
@@ -239,6 +277,7 @@ class Manager:
             subprocess.run(['bash', 'src/port-forward.sh'], check=True)
             self.prepare_observability()
             self.workload_manager.check_usage()
+            self.workload_manager.drain_usage(check=check_threads)
             self.clock.start()
             scheduled = max((entry['timestamp'] for manager in
                 (self.infrastructure_manager, self.workload_manager)
@@ -263,8 +302,9 @@ class Manager:
                     thread.join(.1)
                 check_threads()
             check_threads()
-            # STOP is FIFO: completion requires acknowledgements, not queue.put.
-            self.workload_manager.finish_usage()
+            # Acknowledgements, not queue.put, establish replay completion.
+            # Keep periodic reconciliation alive for pods converging in the tail.
+            self.workload_manager.drain_usage(check=check_threads)
             replay_end = self.clock.monotonic()
             complete = (not self.workload_manager.usage_progress['failed']
                         and not self.workload_manager.usage_progress['errors']
@@ -279,6 +319,8 @@ class Manager:
             tail_start = self.clock.monotonic()
             self.clock.tail()
             report.timing(tail_real=self.clock.monotonic() - tail_start)
+            check_threads()
+            self.workload_manager.finish_usage(timeout=230, allow_progress=True, check=check_interruption)
         except BaseException as error:
             interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
             report.issue(error, component='coordinator')

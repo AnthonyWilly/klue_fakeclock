@@ -39,7 +39,8 @@ class WorkloadManager:
         self.usage_status = multiprocessing.Queue()
         self.usage_manager = UsageManager(self.usage_queue, reconcile_interval_seconds=5 / self.speed_factor,
                                           status_queue=self.usage_status)
-        self.usage_progress = dict(enqueued=0, completed=0, failed=0, pending=0,
+        self.usage_progress = dict(api_concurrency=UsageManager.API_CONCURRENCY,
+            enqueued=0, completed=0, failed=0, pending=0,
             stopped=False, errors=[], late_events=0, max_lag_real=0, total_lag_real=0,
             max_lag_logical=0, total_lag_logical=0, worst_event=None)
         self.usage_stop_sent = False
@@ -191,6 +192,9 @@ class WorkloadManager:
                         progress['worst_event'] = message
             elif kind == 'stopped':
                 progress['stopped'] = True
+            elif kind == 'activity':
+                progress.setdefault('api', {})[message['action']] = message['stats']
+                self.usage_activity = getattr(self, 'usage_activity', 0) + 1
             else:
                 progress['errors'].append(message)
             progress['pending'] = progress['enqueued'] - progress['completed'] - progress['failed']
@@ -200,15 +204,49 @@ class WorkloadManager:
             if not stopping:
                 raise RuntimeError('UsageManager stopped before replay finished')
 
-    def finish_usage(self, timeout=30):
+    def drain_usage(self, timeout=UsageManager.TIME_OUT + 30, check=None):
+        """Wait for all acknowledgements, without stopping periodic reconciliation.
+
+        Only inactivity is bounded: a healthy backlog may take longer than the
+        cleanup deadline. API completions and event acks both prove activity.
+        """
+        last_progress = time.monotonic()
+        previous = None
+        while True:
+            self.check_usage()
+            progress = self.usage_progress
+            if not progress['pending']:
+                return
+            if self.usage_manager.pid is None:
+                raise RuntimeError('queued usage has no running worker')
+            current = (progress['completed'], progress['failed'], getattr(self, 'usage_activity', 0))
+            now = time.monotonic()
+            if current != previous:
+                previous = current
+                last_progress = now
+            if now - last_progress >= timeout:
+                raise RuntimeError('UsageManager made no progress within real inactivity deadline')
+            if check is not None:
+                check()
+            self.usage_manager.join(timeout=.1)
+
+    def finish_usage(self, timeout=30, allow_progress=False, check=None):
         if self.usage_manager.pid is None:
             return
         if not self.usage_stop_sent:
             self.usage_queue.put('STOP')
             self.usage_stop_sent = True
         deadline = time.monotonic() + timeout
+        previous = None
         while self.usage_manager.is_alive():
             self.check_usage(stopping=True)
+            if check is not None:
+                check()
+            current = (self.usage_progress['completed'], self.usage_progress['failed'],
+                       getattr(self, 'usage_activity', 0))
+            if allow_progress and current != previous:
+                deadline = time.monotonic() + timeout
+                previous = current
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError('UsageManager did not drain within real cleanup deadline')

@@ -169,6 +169,7 @@ def make_coordinator(tmp_path, monkeypatch, end, fail_once=False, confirmed=2000
             raise CollectionError('not ingested')
         return confirmed
     result.collector.targets = target
+    result.scrape_watermark = target
     return result
 
 

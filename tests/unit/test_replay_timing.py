@@ -193,6 +193,7 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
     components = {}
     def component(name):
         obj = Mock()
+        obj.usage_lock = __import__('threading').RLock()
         obj.data = {'emulation': []}
         obj.usage_progress = dict(enqueued=0, completed=0, failed=0, pending=0, errors=[],
             late_events=0, total_lag_real=0, total_lag_logical=0)
