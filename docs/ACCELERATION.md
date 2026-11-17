@@ -8,13 +8,52 @@ with the requested factor and produce lag diagnostics. Preparation, readiness,
 HTTP and cleanup timeouts use real seconds. Total execution time is not expected
 to improve proportionally to F.
 
-Use `--output-dir PATH` for a new, exclusive output directory per run. Preserve
+The usage worker processes every event in FIFO order. Within one event, up to
+four independent pod usage writes run concurrently; all must finish before the
+event is acknowledged. Periodic reconciliation groups a single pod snapshot
+by workload, with one deployment snapshot when empty workloads need checking.
+Initial usage is drained before the common replay origin. After replay, queued
+events are acknowledged before the observable tail, while the worker continues
+periodic reconciliation until the tail ends. Healthy backlog and normal shutdown
+may exceed 30 real seconds: API completions and acknowledgements reset a 230-second
+inactivity deadline. Failure/interruption cleanup keeps its bounded stop and kill
+deadlines. No event is coalesced or discarded. `run.json` usage progress includes
+API operation counts, failures, total/max real duration and pod-write concurrency;
+these diagnostics allow capacity to be measured on the execution machine.
+
+Final collection distinguishes node deletion from missing monitoring. It tracks
+initial nodes and successfully completed infrastructure replay actions, checks
+the current fake-node set, and requires scrape targets for live nodes. When the
+replay has removed every emulated node and the API confirms none remain, KWOK
+targets are no longer required; healthy kube-state-metrics scrapes still advance
+the export watermark. Removed targets left temporarily in discovery are ignored.
+Unexpected node disappearance, missing live targets, stale/missing historical
+samples and HTTP errors remain collection errors. `run.json` collection metadata
+includes expected/live node counts and `kwok_targets_not_required`. Autoscaler
+modes retain their existing target policy.
+
+Output is automatic: `output_csv_<trace-directory-name>_YYYY-MM-DD-HH:MM:SS`
+in the current directory. `--output-dir PATH` is an optional override, and
+existing outputs are never overwritten. Preserve
 the raw CSVs and `run.json`; their Unix timestamps are real, cumulative CPU is in
 physical core-seconds, memory is in bytes, and requests/limits are unscaled.
 Logical intervals are 5 s for usage reconciliation, 15 s for KWOK scraping,
 and 30 s for kube-state-metrics scraping and the query grid. Real intervals are
 these values divided by F (at 5×: 1 s, 3 s, 6 s, 6 s). Factors must also satisfy
 the supported whole-millisecond scrape intervals described in the README.
+
+Setup reapplies `kwok-karpenter-install/configuration-files/kube-state-metrics-resources.yaml`
+after the kube-prometheus manifests. This CPU overlay gives kube-state-metrics
+a 100m request and 1000m limit, and its main HTTPS proxy a 100m request and 500m
+limit. It preserves memory settings and the telemetry proxy. The release's 40m
+main-proxy limit caused scrape timeouts on a large trace even at 1×. These
+settings provide initial headroom; verify scrape health at each speed factor.
+Setup also repairs legacy ServiceMonitor apply metadata before reapplying the
+release manifests. Sampling intervals are updated with a patch of endpoints,
+so server-owned metadata is never saved into the last-applied configuration.
+On a fresh cluster, setup waits up to 300 real seconds for the operator to
+create the Prometheus pod, then up to 300 real seconds for it to become Ready.
+Failures remain visible in the execution log and stop setup with a nonzero code.
 
 ## Prepare comparison views locally
 
