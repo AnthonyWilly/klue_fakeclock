@@ -17,7 +17,7 @@ from manager import Manager
 
 class Main:
     def __init__(self, trace_path, nodepool_path, karpenter, tracer_skip, infrastructure, workload, hpa, speed_factor=1, kwok_workers_config=None, output_dir=None, report=None):
-        self.report = report or RunReport(output_dir)
+        self.report = report or RunReport(output_dir, trace_path=trace_path)
         self.report.update(configuration={**self.report.data['configuration'],
             'mode': 'emulation', 'speed_factor': speed_factor, 'karpenter': karpenter,
             'hpa': hpa, 'infrastructure': infrastructure, 'workload': workload})
@@ -106,7 +106,7 @@ def main(argv=None):
     parser.add_argument('--speed-factor', default='1')
     parser.add_argument('--output-dir')
     args = parser.parse_args(argv)
-    report = RunReport(args.output_dir, resume=bool(os.environ.get('KLUE_RUN_ID')))
+    report = RunReport(args.output_dir, resume=bool(os.environ.get('KLUE_RUN_ID')), trace_path=args.trace_path)
     if os.environ.get('KLUE_RUN_ID') and report.data['run_id'] != os.environ['KLUE_RUN_ID']:
         raise ValueError('shell run identity does not match output directory')
     previous_term = signal.getsignal(signal.SIGTERM)

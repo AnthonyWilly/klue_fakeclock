@@ -171,7 +171,12 @@ accelerated execution; evaluate that separately on the target machine.
 
 `--output-dir PATH` selects a new, exclusive directory for raw CSVs,
 `emulation.log` and `run.json`. Existing directories and archives are rejected.
-Without the flag, KLUE creates `output_csv_<run-id>` in the current directory.
+Without the flag, KLUE automatically creates
+`output_csv_<trace-directory-name>_YYYY-MM-DD-HH:MM:SS` in the current directory.
+For example, `--data-path data/full-trace-reduzido-30-minutos/` produces
+`output_csv_full-trace-reduzido-30-minutos_2026-11-17-15:30:00`.
+Names are sanitized for filesystem use; a numeric suffix avoids collisions with
+existing directories or ZIPs. The run ID remains independent of the folder name.
 The Python CLI also accepts `--output-dir` as an optional final argument.
 
 The shell creates the report before validation and external setup; Python

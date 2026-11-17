@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+import re
 from datetime import datetime, timezone
 
 
@@ -23,12 +24,33 @@ def utc_now():
 class RunReport:
     DETAIL_LIMIT = 100
 
-    def __init__(self, output_dir=None, *, resume=False, monotonic=None, configuration=None):
+    def __init__(self, output_dir=None, *, resume=False, monotonic=None, configuration=None, trace_path=None):
         self.monotonic = monotonic or time.monotonic
         self.lock = threading.RLock()
         self.interruption_requested = False
         run_id = uuid.uuid4().hex
-        self.output_dir = Path(output_dir or f"output_csv_{run_id}").resolve()
+        if resume and not output_dir:
+            raise ValueError('resuming a run requires its output directory')
+        automatic = not output_dir
+        if automatic:
+            label = Path(str(trace_path).rstrip('/')).name if trace_path else ''
+            label = re.sub(r'[^\w.-]+', '-', label).strip('.-').encode()[:100].decode(errors='ignore')
+            prefix = f'output_csv_{label}_' if label else 'output_csv_'
+            base = prefix + datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+            suffix = 0
+            while True:
+                candidate = Path(base + (f'_{suffix}' if suffix else '')).resolve()
+                if Path(str(candidate) + '.zip').exists():
+                    suffix += 1
+                    continue
+                try:
+                    candidate.mkdir(parents=True, exist_ok=False)
+                except FileExistsError:
+                    suffix += 1
+                    continue
+                output_dir = candidate
+                break
+        self.output_dir = Path(output_dir).resolve()
         self.path = self.output_dir / 'run.json'
         if resume:
             self.data = json.loads(self.path.read_text())
@@ -38,7 +60,8 @@ class RunReport:
             # Even an empty existing directory belongs to somebody else.
             if Path(str(self.output_dir) + '.zip').exists():
                 raise FileExistsError(f'archive already exists: {self.output_dir}.zip')
-            self.output_dir.mkdir(parents=True, exist_ok=False)
+            if not automatic:
+                self.output_dir.mkdir(parents=True, exist_ok=False)
             try:
                 revision = subprocess.check_output(
                     ['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent,
@@ -123,6 +146,7 @@ def main():
     parser.add_argument('--stage', default='setup')
     parser.add_argument('--exit-code', type=int, default=0)
     parser.add_argument('--mode')
+    parser.add_argument('--trace-path')
     parser.add_argument('--speed-factor')
     parser.add_argument('--infrastructure')
     parser.add_argument('--workload')
@@ -133,7 +157,7 @@ def main():
     configuration = {key: value for key, value in vars(args).items()
                      if key in ('mode', 'speed_factor', 'infrastructure', 'workload', 'karpenter', 'hpa')
                      and value is not None}
-    report = RunReport(args.output_dir, configuration=configuration) if args.action == 'init' else None
+    report = RunReport(args.output_dir, configuration=configuration, trace_path=args.trace_path) if args.action == 'init' else None
     if args.action == 'init':
         print(report.output_dir)
         return

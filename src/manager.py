@@ -35,7 +35,7 @@ class Manager:
         """
         Initializes the Manager class.
         """
-        self.report = report or RunReport(output_dir)
+        self.report = report or RunReport(output_dir, trace_path=data_path)
         self.output_dir = str(self.report.output_dir)
         self.speed_factor = validate_speed_factor(speed_factor, karpenter=karpenter, hpa=hpa)
         self.intervals = SamplingIntervals(self.speed_factor)

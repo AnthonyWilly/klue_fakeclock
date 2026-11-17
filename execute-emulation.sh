@@ -129,6 +129,7 @@ done
 output_args=()
 [[ -n $OUTPUT_DIR ]] && output_args=(--output-dir "$OUTPUT_DIR")
 OUTPUT_DIR=$(python3 "$REPORT_HELPER" init "${output_args[@]}" --mode "$ENVIRONMENT" \
+    --trace-path "$TRACE_PATH" \
     --speed-factor="$SPEED_FACTOR" --infrastructure "$INFRASTRUCTURE" --workload "$WORKLOAD" \
     --karpenter "$KARPENTER" --hpa "$HPA") || exit $?
 export KLUE_RUN_ID
