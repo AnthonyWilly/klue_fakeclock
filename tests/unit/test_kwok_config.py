@@ -47,6 +47,23 @@ def test_unsupported_installed_config_fails():
         merge_workers({'data': {'kwok.yaml': 'kind: Unsupported'}}, {'nodeLeaseParallelism': 2})
 
 
+def test_ksm_cli_emits_only_endpoint_patch_from_live_object():
+    monitor = dict(apiVersion='monitoring.coreos.com/v1', kind='ServiceMonitor',
+        metadata=dict(name='kube-state-metrics', resourceVersion='724', uid='server-uid',
+                      annotations={'kubectl.kubernetes.io/last-applied-configuration': 'base'}),
+        status={'server': 'owned'},
+        spec=dict(selector={'keep': 'selector'}, endpoints=[
+            dict(port='https-main', interval='30s', bearerTokenFile='/token',
+                 tlsConfig={'insecureSkipVerify': True}),
+            dict(port='https-self', interval='30s', scheme='https')]))
+    result = subprocess.run([sys.executable, 'src/kwok_config.py', 'ksm', '--speed-factor', '2'],
+        cwd=ROOT, input=json.dumps(monitor), capture_output=True, text=True,
+        timeout=10, check=True)
+    expected = copy.deepcopy(monitor['spec']['endpoints'])
+    expected[0].update(interval='15s', scrapeTimeout='10s')
+    assert json.loads(result.stdout) == {'spec': {'endpoints': expected}}
+
+
 def test_preflight_shell_and_python_reject_workers_before_setup(tmp_path):
     # Running the actual preflight with failing inputs must never reach these shims.
     bindir = tmp_path / 'bin'

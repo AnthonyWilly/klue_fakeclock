@@ -48,7 +48,10 @@ def main():
             json.dump(merge_workers(json.load(sys.stdin), overrides), sys.stdout)
         elif args.action == 'ksm':
             from sampling import SamplingIntervals, configure_ksm
-            json.dump(configure_ksm(json.load(sys.stdin), SamplingIntervals(args.speed_factor).ksm), sys.stdout)
+            monitor = configure_ksm(json.load(sys.stdin), SamplingIntervals(args.speed_factor).ksm)
+            # Patch only owned fields. Applying a live object would persist its
+            # resourceVersion/uid in last-applied and break later manifest applies.
+            json.dump({'spec': {'endpoints': monitor['spec']['endpoints']}}, sys.stdout)
     except (ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
 

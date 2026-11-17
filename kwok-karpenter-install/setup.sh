@@ -30,7 +30,18 @@ kubectl wait \
 	--for condition=Established \
 	--all CustomResourceDefinition \
 	--namespace=monitoring
+# Repair last-applied metadata left by older setups that applied the live
+# ServiceMonitor. Otherwise the base manifest tries to clear resourceVersion.
+KSM_MANIFEST="$SCRIPT_DIR/kube-prometheus/manifests/kubeStateMetrics-serviceMonitor.yaml"
+KSM_EXISTING=$(kubectl -n monitoring get servicemonitor kube-state-metrics --ignore-not-found -o name)
+if [[ -n $KSM_EXISTING ]]; then
+    kubectl apply set-last-applied -f "$KSM_MANIFEST" --create-annotation=true
+fi
 kubectl apply -f kube-prometheus/manifests/
+# Release defaults throttle the main metrics proxy on large traces. Reapply
+# our CPU overlay after the manifests so subsequent setup runs retain it.
+kubectl -n monitoring patch deployment kube-state-metrics --type=strategic \
+    --patch-file "$SCRIPT_DIR/configuration-files/kube-state-metrics-resources.yaml"
 # Main metrics endpoint only; preserve the installed monitor's other fields.
 KSM_OVERLAY=$(mktemp) || exit $?
 if ! kubectl -n monitoring get servicemonitor kube-state-metrics -o json > "$KSM_OVERLAY"; then
@@ -38,7 +49,8 @@ if ! kubectl -n monitoring get servicemonitor kube-state-metrics -o json > "$KSM
     exit 1
 fi
 python3 "$SCRIPT_DIR/../src/kwok_config.py" ksm --speed-factor="${KLUE_SPEED_FACTOR:-1}" < "$KSM_OVERLAY" > "$KSM_OVERLAY.patched" || exit $?
-kubectl apply -f "$KSM_OVERLAY.patched" || exit $?
+kubectl -n monitoring patch servicemonitor kube-state-metrics --type=merge \
+    --patch-file "$KSM_OVERLAY.patched" || exit $?
 rm -f "$KSM_OVERLAY" "$KSM_OVERLAY.patched"
 
 docker login
@@ -59,19 +71,13 @@ fi
 
 ./install-kwok.sh || exit $?
 
-while true; do
-	STATUS=$(kubectl get pod prometheus-k8s-0 -n monitoring \
-		-o jsonpath='{.status.phase}' 2>/dev/null)
+# The operator creates this pod asynchronously, especially on a fresh cluster.
+# A get before creation exits under set -e; wait for creation and then readiness.
+echo "Waiting for Prometheus to be created and ready..."
+kubectl -n monitoring wait --for=create pod/prometheus-k8s-0 --timeout=300s
+kubectl -n monitoring wait --for=condition=Ready pod/prometheus-k8s-0 --timeout=300s
 
-	if [[ "$STATUS" == "Running" ]]; then
-		break
-	fi
-
-	echo "Waiting for Prometheus to be available..."
-	sleep 5
-done
-
-echo "Prometheus is running."
+echo "Prometheus is ready."
 
 # -----------------------------
 # Grafana configuration

@@ -1,0 +1,18 @@
+# CPU headroom for large emulated workloads. Strategic merge preserves the
+# release's memory settings, authentication, arguments and telemetry sidecar.
+spec:
+  template:
+    spec:
+      containers:
+        - name: kube-state-metrics
+          resources:
+            requests:
+              cpu: 100m
+            limits:
+              cpu: 1000m
+        - name: kube-rbac-proxy-main
+          resources:
+            requests:
+              cpu: 100m
+            limits:
+              cpu: 500m
