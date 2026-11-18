@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
@@ -272,6 +273,12 @@ waiting:
 	return err
 }
 
+func loadKubernetesConfig() (*rest.Config, error) {
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{},
+	).ClientConfig()
+}
+
 func run() error {
 	path := flag.String("mapping", "./pods_and_nodes_map.csv", "initial placement CSV")
 	workers := flag.Int("workers", 1, "maximum concurrent binds (1-8)")
@@ -284,7 +291,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+	config, err := loadKubernetesConfig()
 	if err != nil {
 		return err
 	}

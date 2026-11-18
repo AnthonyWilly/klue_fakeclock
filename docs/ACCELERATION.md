@@ -17,6 +17,11 @@ When a pod's CPU metadata is absent, the tracer preserves its node from resource
 metrics and recovers the instance type only from an unambiguous type for that
 node in the trace. It does not invent a destination or choose a conflicting type.
 
+The initial Go scheduler loads the current context using the standard client-go
+rules: merge files listed in `KUBECONFIG` when set, otherwise load
+`~/.kube/config`. The environment variable does not need to be set for a local
+cluster configured through the default kubeconfig.
+
 The usage worker processes every event in FIFO order. Within one event, up to
 four independent pod usage writes run concurrently; all must finish before the
 event is acknowledged. Periodic reconciliation groups a single pod snapshot
