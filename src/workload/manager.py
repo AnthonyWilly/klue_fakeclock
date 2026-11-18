@@ -22,6 +22,8 @@ class WorkloadManager:
     TIME_OUT = 200
     CREATION_TIMEOUT = 600
     SCHEDULING_TIMEOUT = 600
+    # Usage events admitted and not yet terminal: transport, worker buffer and execution.
+    USAGE_ADMISSION_LIMIT = 1024
     def __init__(self, data_path, emulation_phase, hpa, speed_factor=1):
         """
         Initializes the Workload Manager class.
@@ -44,10 +46,15 @@ class WorkloadManager:
         self.replay_diagnostics = ReplayDiagnostics(len(self.data['emulation']))
         self.usage_queue = multiprocessing.Queue()
         self.usage_lock = threading.RLock()
+        # Serializes producers only; never needed to consume acknowledgements.
+        self.usage_admission_lock = threading.Lock()
         self.usage_status = multiprocessing.Queue()
         self.usage_manager = UsageManager(self.usage_queue, reconcile_interval_seconds=5 / self.speed_factor,
-                                          status_queue=self.usage_status)
+                                          status_queue=self.usage_status,
+                                          event_workers=self.setup_concurrency)
         self.usage_progress = dict(api_concurrency=UsageManager.API_CONCURRENCY,
+            event_workers=self.setup_concurrency,
+            admission=dict(limit=self.USAGE_ADMISSION_LIMIT, waits=0, wait_real=0, max_wait_real=0),
             enqueued=0, completed=0, failed=0, pending=0,
             stopped=False, errors=[], late_events=0, max_lag_real=0, total_lag_real=0,
             max_lag_logical=0, total_lag_logical=0, worst_event=None)
@@ -154,7 +161,7 @@ class WorkloadManager:
                         "speed_factor": clock.speed_factor,
                     })
                     diagnostics.apply(clock, scheduled, {"action": "queue-usage"},
-                                      self.set_workload_usage, event)
+                                      self.set_workload_usage, event, getattr(clock, 'cancel', None))
                 elif kind == 'scale' and not self.hpa:
                     diagnostics.apply(clock, scheduled, action,
                                       self.scale_workload, action)
@@ -219,6 +226,9 @@ class WorkloadManager:
                         progress['worst_event'] = message
             elif kind == 'stopped':
                 progress['stopped'] = True
+            elif kind == 'concurrency':
+                # Requested and observed worker concurrency of the usage process.
+                progress['concurrency'] = message['stats']
             elif kind == 'cache':
                 # Observation counters only; they do not prove usage progress.
                 progress['resource_cache'] = message['stats']
@@ -419,15 +429,73 @@ class WorkloadManager:
         pods = self.k8s_api.list_pod_for_all_namespaces()
         return sum(1 for pod in pods.items if pod.metadata.namespace in namespaces)
     
-    def set_workload_usage(self, usage_info):
-        """Deliver one event with a unique identity; only delivered events count."""
-        with self.usage_lock:
-            self.check_usage()
-            event = dict(usage_info, event_id=self.usage_tracker.next_event_id)
-            self.usage_queue.put(event)
-            self.usage_tracker.register(event)
-            self.usage_progress['enqueued'] += 1
-            self.usage_progress['pending'] = len(self.usage_tracker.pending)
+    def set_workload_usage(self, usage_info, cancel=None):
+        """Deliver one event with a unique identity; only delivered events count.
+
+        At most ``USAGE_ADMISSION_LIMIT`` events are admitted and not terminal.
+        The producer waits for capacity, and puts the event, without holding
+        ``usage_lock``, which the acknowledgement consumer needs. The identity
+        is registered before the put so an early acknowledgement is never
+        unknown; a failed put withdraws it, leaving no pending event.
+        """
+        with self.usage_admission_lock:
+            self.wait_usage_capacity(cancel)
+            with self.usage_lock:
+                event = dict(usage_info, event_id=self.usage_tracker.next_event_id)
+                self.usage_tracker.register(event)
+            try:
+                self.usage_queue.put(event)
+            except BaseException:
+                with self.usage_lock:
+                    self.usage_tracker.withdraw(event['event_id'])
+                    self.usage_progress['pending'] = len(self.usage_tracker.pending)
+                raise
+            with self.usage_lock:
+                self.usage_progress['enqueued'] += 1
+                self.usage_progress['pending'] = len(self.usage_tracker.pending)
+
+    def wait_usage_capacity(self, cancel=None, timeout=UsageManager.TIME_OUT + 30, poll=.05):
+        """Wait, interruptibly, until fewer than the admission limit are pending.
+
+        Capacity is released only by terminal acknowledgements, never inferred
+        from queue sizes. Worker failure or a full admission without progress for
+        ``timeout`` real seconds raises instead of waiting forever.
+        """
+        started = time.monotonic()
+        last_progress, previous = started, None
+        waited = False
+        try:
+            while True:
+                self.check_usage()
+                with self.usage_lock:
+                    if len(self.usage_tracker.pending) < self.USAGE_ADMISSION_LIMIT:
+                        return
+                    current = (self.usage_progress['completed'], self.usage_progress['failed'],
+                               getattr(self, 'usage_activity', 0))
+                waited = True
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError('replay cancelled while waiting for usage capacity')
+                if self.usage_manager.pid is None:
+                    raise RuntimeError('usage admission is full and has no running worker')
+                now = time.monotonic()
+                if current != previous:
+                    previous, last_progress = current, now
+                if now - last_progress >= timeout:
+                    raise RuntimeError('UsageManager made no progress while usage admission was full')
+                if cancel is not None:
+                    cancel.wait(poll)
+                else:
+                    time.sleep(poll)
+        finally:
+            if waited:
+                duration = time.monotonic() - started
+                with self.usage_lock:
+                    admission = self.usage_progress.setdefault(
+                        'admission', dict(limit=self.USAGE_ADMISSION_LIMIT, waits=0, wait_real=0,
+                                          max_wait_real=0))
+                    admission['waits'] += 1
+                    admission['wait_real'] += duration
+                    admission['max_wait_real'] = max(admission['max_wait_real'], duration)
 
     def scale_workload(self, scale_info):
         name = scale_info['name']

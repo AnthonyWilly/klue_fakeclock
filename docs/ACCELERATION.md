@@ -22,10 +22,28 @@ rules: merge files listed in `KUBECONFIG` when set, otherwise load
 `~/.kube/config`. The environment variable does not need to be set for a local
 cluster configured through the default kubeconfig.
 
-The usage worker processes every event in FIFO order. Within one event, up to
-four independent pod usage writes run concurrently; all must finish before the
-event is acknowledged. Periodic reconciliation groups a single pod snapshot
-by workload, with one deployment snapshot when empty workloads need checking.
+The usage worker keeps FIFO order per workload, not globally. Events of one
+`(namespace, workload)` and its periodic reconciliations run one at a time in
+arrival order; independent workloads run on `min(8, ceil(F))` event workers
+(one at 1×, two at 2×), served round-robin so a long backlog of one workload
+does not delay the others. An event's usage replaces the workload's previous
+usage only when the event starts. All ClusterResourceUsage creates, patches and
+deletes, including cleanup and periodic reconciliation, share one limit of four
+concurrent calls, also served round-robin per workload; every write of an event
+must finish before the event is acknowledged. A periodic reconciliation still
+queued for a workload is not queued again.
+
+At most 1024 usage events are admitted and not yet terminal, counting the
+transport queue, the worker buffer and execution. A producer at the limit waits,
+interruptibly and without holding the lock used to consume acknowledgements,
+until any terminal acknowledgement releases capacity; worker failure or 230 real
+seconds without worker progress fail the wait. STOP ends admission and is
+confirmed only after every accepted event reached its outcome. On failure or
+interruption, events without an outcome are reported `cancelled` within five
+real seconds, including an event whose call hangs; such an event never reports
+another outcome later. `progress.usage.concurrency` records the requested event
+and write workers and the maximum observed, and `progress.usage.admission` the
+limit and producer waits.
 Initial usage is drained before the common replay origin. After replay, queued
 events are acknowledged before the observable tail, while the worker continues
 periodic reconciliation until the tail ends. Healthy backlog and normal shutdown
@@ -258,8 +276,8 @@ The factor also selects `min(8, ceil(F))` setup application and bind workers
 operations on one namespace/kind/name remain serial with isolated object bodies.
 Namespaces precede applications, fake nodes precede binds, and all parallel
 results are joined. Errors stop preparation. This does not change KWOK workers,
-client QPS/burst, usage distribution or FIFO event order; the usage pool still
-allows four pod writes within one event and acknowledges completion.
+client QPS/burst or usage distribution; usage events keep FIFO order per
+workload and the four concurrent usage writes remain a global limit.
 
 Setup identifies fake nodes explicitly, ignoring real-node counts and rejecting
 extra fake nodes. NodeClaims resolve their destination via `status.nodeName`.

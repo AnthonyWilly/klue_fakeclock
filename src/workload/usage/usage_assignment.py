@@ -1,3 +1,5 @@
+import threading
+
 from workload.usage.heuristics.homogeneous_spread import HomogeneousSpreadHeuristic
 from workload.usage.heuristics.inverse_cdf_sampling import InverseCDFSamplingHeuristic
 
@@ -28,7 +30,9 @@ class UsageAssignmentEngine:
         #   }
         # }
         self.state = {}
-
+        # Callers serialize each workload; this guards the shared dictionary
+        # when different workloads are resolved concurrently.
+        self.state_lock = threading.Lock()
 
         # Heuristics are configured separately per resource.
         # This allows CPU and memory to use different strategies in the future,
@@ -67,7 +71,8 @@ class UsageAssignmentEngine:
             }
         """
 
-        workload_state = self.state.setdefault(workload_key, {"mapping": {}, "last_assignment": {}})
+        with self.state_lock:
+            workload_state = self.state.setdefault(workload_key, {"mapping": {}, "last_assignment": {}})
         real_pods = set(real_pods_usage.keys())
 
         # ----------------------------
@@ -174,4 +179,5 @@ class UsageAssignmentEngine:
         This should be called when the workload disappears from the emulation,
         for example when its Deployment is deleted.
         """
-        self.state.pop(workload_key, None)
+        with self.state_lock:
+            self.state.pop(workload_key, None)

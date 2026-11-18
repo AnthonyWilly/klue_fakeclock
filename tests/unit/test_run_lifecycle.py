@@ -190,6 +190,7 @@ def usage_parent(messages=(), exitcode=None, events=2, monotonic=None):
     for event_id in range(1, events + 1):
         parent.usage_tracker.register(dict(namespace='ns', name='app', event_id=event_id))
     parent.usage_lock = threading.RLock()
+    parent.usage_admission_lock = threading.Lock()
     parent.usage_status = queue.Queue()
     for message in messages:
         parent.usage_status.put(message)
@@ -221,7 +222,8 @@ def test_worker_acknowledges_actual_reconciliation_and_fifo_stop():
     worker = UsageManager(events, status_queue=statuses)
     worker.handle_set_usage_event = Mock(return_value=APPLIED)
     worker.process_events(monotonic=lambda: 12)
-    started, ack, stopped = statuses.get_nowait(), statuses.get_nowait(), statuses.get_nowait()
+    started, ack, concurrency, stopped = (statuses.get_nowait() for _ in range(4))
+    assert concurrency['kind'] == 'concurrency' and concurrency['stats']['event_workers'] == 1
     assert started['kind'] == 'started' and started['event_id'] == 1
     assert ack['completed'] and ack['lag_real'] == 2 and ack['lag_logical'] == 4
     assert ack['event_id'] == 1 and ack['outcome'] == APPLIED

@@ -8,6 +8,7 @@ from kubernetes.client.rest import ApiException
 
 from test_run_lifecycle import lifecycle, usage_ack, usage_parent
 from test_usage_resource_cache import caches, deployment, pod as cached_pod
+from workload.usage.event_dispatcher import FairExecutor
 from workload.usage.usage_manager import UsageManager
 
 
@@ -145,7 +146,6 @@ def test_drain_and_stop_surround_the_observable_tail(lifecycle):
 
 def test_pod_writes_are_parallel_but_each_event_has_a_completion_barrier():
     import threading
-    from concurrent.futures import ThreadPoolExecutor
     from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
     worker = UsageManager(queue.Queue())
     worker.cru_generator = ClusterResourceUsageGenerator()
@@ -159,12 +159,12 @@ def test_pod_writes_are_parallel_but_each_event_has_a_completion_barrier():
     worker.apply_cru = apply
     worker.delete_stale_crus = Mock()
     assignment = {('ns', f'p{i}'): dict(cpu=1, memory=100) for i in range(4)}
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        worker.usage_executor = executor
-        with pytest.raises(RuntimeError, match='one pod failed'):
-            worker.apply_assignment(('ns', 'app'), assignment)
-        assert len(finished) == 4
-        worker.delete_stale_crus.assert_not_called()
+    worker.usage_executor = FairExecutor(4)
+    with pytest.raises(RuntimeError, match='one pod failed'):
+        worker.apply_assignment(('ns', 'app'), assignment)
+    assert len(finished) == 4
+    worker.delete_stale_crus.assert_not_called()
+    assert worker.usage_executor.shutdown(5)
 
 
 def clock_sequence(*values):
@@ -259,7 +259,6 @@ def test_reconciliation_outcomes_distinguish_applied_empty_and_absent_target(cac
 
 
 def test_partial_pod_failure_is_a_failed_terminal_outcome(caches):
-    from concurrent.futures import ThreadPoolExecutor
     from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
     from workload.usage.usage_tracking import UsageTracker
     worker = worker_with_pods(caches, [cached_pod('p0', 'app'), cached_pod('p1', 'app')])
@@ -274,9 +273,9 @@ def test_partial_pod_failure_is_a_failed_terminal_outcome(caches):
     tracker = UsageTracker(lambda: 0)
     event = replay_event(1, 2)
     tracker.register(event)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        worker.usage_executor = executor
-        worker.process_event(event, clock_sequence(101, 102))
+    worker.usage_executor = FairExecutor(2)
+    worker.process_event(event, clock_sequence(101, 102))
+    assert worker.usage_executor.shutdown(5)
     messages = [worker.status_queue.get_nowait() for _ in range(worker.status_queue.qsize())]
     [ack] = [message for message in messages if message['kind'] == 'ack']
     assert ack['outcome'] == 'failed' and not ack['completed'] and 'p1 denied' in ack['message']

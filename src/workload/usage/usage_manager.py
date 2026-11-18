@@ -2,13 +2,13 @@ import multiprocessing
 import queue
 import time
 import math
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import threading
 
 from kubernetes.client.rest import ApiException
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
+from workload.usage.event_dispatcher import EventDispatcher, FairExecutor
 from workload.usage.resource_cache import ResourceCache, is_live_pod, pod_limits
 from workload.usage.usage_assignment import UsageAssignmentEngine
 from workload.usage.usage_tracking import APPLIED, CANCELLED, EMPTY, FAILED, TARGET_ABSENT
@@ -26,6 +26,10 @@ class UsageManager(multiprocessing.Process):
         2. the cache reports a relevant change of a tracked workload.
     - Delegates usage distribution to UsageAssignmentEngine.
     - Applies the returned assignment as one ClusterResourceUsage per emulated pod.
+
+    Events and reconciliations of one (namespace, workload) run in FIFO order,
+    one at a time; independent workloads run on ``event_workers`` threads. All
+    ClusterResourceUsage mutations share one pool of ``API_CONCURRENCY`` calls.
     """
 
     TIME_OUT = 200
@@ -36,16 +40,23 @@ class UsageManager(multiprocessing.Process):
     CACHE_STOP_TIMEOUT = 5
     # Real time a deployment confirmed by the API may take to reach the cache.
     CACHE_CATCH_UP_TIMEOUT = 10
+    # Real time accepted events get to finish after a failure or interruption.
+    CANCEL_TIMEOUT = 5
+    WRITER_STOP_TIMEOUT = 5
 
     CRU_GROUP = "kwok.x-k8s.io"
     CRU_VERSION = "v1alpha1"
     CRU_PLURAL = "clusterresourceusages"
 
-    def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS, status_queue=None):
+    def __init__(self, queue, reconcile_interval_seconds=RECONCILE_INTERVAL_SECONDS, status_queue=None,
+                 event_workers=1):
         super().__init__()
         if not math.isfinite(reconcile_interval_seconds) or reconcile_interval_seconds <= 0:
             raise ValueError("reconciliation interval must be positive and finite")
+        if event_workers < 1:
+            raise ValueError("usage worker needs at least one event worker")
         self.queue = queue
+        self.event_workers = event_workers
         self.status_queue = status_queue
         self.reconcile_interval_seconds = reconcile_interval_seconds
 
@@ -67,12 +78,19 @@ class UsageManager(multiprocessing.Process):
         # Workloads whose reconciliation failed and must be examined again.
         self.retry_workloads = set()
 
+        # Workloads with a periodic reconciliation queued and not yet started.
+        self.queued_reconciliations = set()
+
         # set(cru_name)
         self.existing_crus = set()
+        # Guards the containers above. Each workload's entries are only changed
+        # by its own serialized task; the lock protects the shared containers.
+        self.state_lock = threading.RLock()
         self.resource_cache = None
         self.api_stats = {}
         self.api_lock = None
         self.usage_executor = None
+        self.dispatcher = None
 
     def log(self, message):
         print(f"[USAGE MANAGER] {message}", flush=True)
@@ -97,11 +115,13 @@ class UsageManager(multiprocessing.Process):
             try:
                 # Events wait in the queue until the cache can answer them.
                 self.resource_cache.start().wait_ready(self.CACHE_READY_TIMEOUT)
-                # Only independent pods of the SAME event run concurrently. Wait
-                # for every result before acknowledging or consuming the next event.
-                with ThreadPoolExecutor(max_workers=self.API_CONCURRENCY) as executor:
-                    self.usage_executor = executor
+                # One bounded writer for every task; tasks wait for their own writes.
+                self.usage_executor = FairExecutor(self.API_CONCURRENCY)
+                try:
                     self.process_events()
+                finally:
+                    if not self.usage_executor.shutdown(self.WRITER_STOP_TIMEOUT):
+                        self.log("[WARN] usage writers did not stop in time")
             finally:
                 if not self.resource_cache.stop(self.CACHE_STOP_TIMEOUT):
                     self.log("[WARN] resource cache threads did not stop in time")
@@ -136,17 +156,52 @@ class UsageManager(multiprocessing.Process):
         if self.resource_cache is not None:
             self.emit(kind='cache', stats=stats or self.resource_cache.stats())
 
+    def emit_concurrency(self):
+        dispatcher, writer = self.dispatcher, self.usage_executor
+        stats = dict(event_workers=self.event_workers, mutation_workers=self.API_CONCURRENCY)
+        if dispatcher is not None:
+            events = dispatcher.stats()
+            stats.update(max_active_events=events['max_active'], buffered_events=events['buffered'],
+                         max_buffered_events=events['max_buffered'],
+                         cancelled_events=events['cancelled'])
+        if writer is not None:
+            stats['max_active_mutations'] = writer.stats()['max_running']
+        self.emit(kind='concurrency', stats=stats)
+
     def process_events(self, monotonic=None):
-        """A busy queue cannot starve reconciliation; events retain FIFO order."""
+        """Receive events and keep the periodic grid while workers process them.
+
+        Events of one workload keep FIFO order with each other and with its
+        periodic reconciliations; independent workloads run concurrently. A
+        busy queue cannot starve reconciliation. STOP ends admission; it is
+        confirmed only after every accepted event reached its terminal outcome.
+        On failure or interruption, events without an outcome are reported
+        cancelled within ``CANCEL_TIMEOUT`` real seconds.
+        """
         monotonic = monotonic or time.monotonic
+        self.dispatcher = EventDispatcher(self.event_workers)
+        try:
+            self._receive(monotonic)
+        except BaseException:
+            if not self.dispatcher.cancel(self.CANCEL_TIMEOUT):
+                self.log("[WARN] usage event threads did not stop in time")
+            self.emit_concurrency()
+            raise
+        finally:
+            self.dispatcher = None
+
+    def _receive(self, monotonic):
+        dispatcher = self.dispatcher
         deadline = monotonic() + self.reconcile_interval_seconds
         while True:
+            dispatcher.check()
             now = monotonic()
             if now >= deadline:
                 try:
                     self.reconcile_tracked_workloads()
                 except Exception as error:
                     self.emit(kind='error', message=str(error), action='periodic-reconciliation')
+                self.emit_concurrency()
                 # Skip expired ticks, never shift the periodic grid to event arrival.
                 now = monotonic()
                 deadline += (int((now - deadline) // self.reconcile_interval_seconds) + 1) * self.reconcile_interval_seconds
@@ -156,26 +211,53 @@ class UsageManager(multiprocessing.Process):
                 continue
             if event == "STOP":
                 self.log("Stopping UsageManager")
+                # The parent bounds a stalled stop; the worker never drops accepted work.
+                while not dispatcher.wait_idle(1):
+                    dispatcher.check()
+                dispatcher.check()
+                if not dispatcher.close(self.CANCEL_TIMEOUT):
+                    raise RuntimeError("usage event threads did not stop after their work finished")
+                self.emit_concurrency()
                 self.emit_cache()
                 self.emit(kind='stopped')
                 break
-            self.process_event(event, monotonic)
+            self.submit_event(event, monotonic)
 
-    def process_event(self, event, monotonic):
+    def submit_event(self, event, monotonic):
+        key = (event.get('namespace'), event.get('name'))
+        self.dispatcher.submit(
+            key, lambda claim: self.process_event(event, monotonic, claim),
+            on_cancel=lambda: self.cancel_event(event, monotonic))
+
+    @staticmethod
+    def event_context(event):
+        timing = event.get('replay_timing') or {}
+        return dict(event_id=event.get('event_id'), namespace=event.get('namespace'),
+                    resource=event.get('name'), trace_timestamp=timing.get('trace_timestamp'))
+
+    def cancel_event(self, event, monotonic):
+        """Terminal outcome of an event abandoned before it reported one."""
+        self.emit(kind='ack', outcome=CANCELLED, completed=False, finished_monotonic=monotonic(),
+                  message='usage event cancelled before completion', **self.event_context(event))
+
+    def process_event(self, event, monotonic, claim=None):
         """Emit one start and exactly one terminal outcome for an accepted event.
 
         ``lag_real`` keeps its meaning: delay until the worker started the
-        event. Completion lag is derived from ``finished_monotonic``.
+        event. Completion lag is derived from ``finished_monotonic``. When
+        ``claim`` is given, the outcome is reported only if this call wins it;
+        an event already reported cancelled never reports another outcome.
         """
         timing = event.get('replay_timing') or {}
         started = monotonic()
         lag = max(0, started - timing.get('scheduled_monotonic', started))
-        context = dict(event_id=event.get('event_id'), namespace=event.get('namespace'),
-                       resource=event.get('name'), trace_timestamp=timing.get('trace_timestamp'))
+        context = self.event_context(event)
         self.emit(kind='started', event_id=context['event_id'], started_monotonic=started)
         def acknowledge(outcome, **fields):
-            self.emit(kind='ack', outcome=outcome, completed=outcome not in (FAILED, CANCELLED),
-                      started_monotonic=started, finished_monotonic=monotonic(), **fields, **context)
+            finished = monotonic()
+            if claim is None or claim():
+                self.emit(kind='ack', outcome=outcome, completed=outcome not in (FAILED, CANCELLED),
+                          started_monotonic=started, finished_monotonic=finished, **fields, **context)
         try:
             outcome = self.handle_set_usage_event(event)
         except Exception as error:
@@ -208,13 +290,17 @@ class UsageManager(multiprocessing.Process):
                 "memory": int(usage.get("memory"))
             }
 
-        self.last_usage_actions[workload_key] = usage_action
+        # Recorded when the event starts: later events of this workload are
+        # still queued behind it and cannot replace the usage it applies.
+        with self.state_lock:
+            self.last_usage_actions[workload_key] = usage_action
 
         try:
             return self.reconcile_workload(workload_key=workload_key)
         except Exception:
             # Periodic reconciliation retries a workload whose event failed.
-            self.retry_workloads.add(workload_key)
+            with self.state_lock:
+                self.retry_workloads.add(workload_key)
             raise
 
     # --------------------------------------------------
@@ -227,27 +313,50 @@ class UsageManager(multiprocessing.Process):
 
         Only workloads marked by the cache, or whose previous reconciliation
         failed, are examined; no request is issued for unchanged workloads.
+        With a dispatcher, each one is queued behind the events of its workload;
+        a workload with a reconciliation still queued is not queued again,
+        because that one will read the cache when it starts.
         """
 
         if self.resource_cache is None:
             return
         self.emit_cache()
-        changed = self.resource_cache.take_dirty() | self.retry_workloads
-        self.retry_workloads = set()
-        for workload_key in [key for key in self.last_usage_actions if key in changed]:
-            # A failure for one workload must not starve later workloads.
-            try:
-                view = self.observe_workload(workload_key)
-                if view is None:
-                    self.cleanup_workload(workload_key)
+        with self.state_lock:
+            changed = self.resource_cache.take_dirty() | self.retry_workloads
+            self.retry_workloads = set()
+            keys = [key for key in self.last_usage_actions if key in changed]
+        dispatcher = self.dispatcher
+        for workload_key in keys:
+            if dispatcher is None:
+                self.reconcile_tracked_workload(workload_key)
+                continue
+            with self.state_lock:
+                if workload_key in self.queued_reconciliations:
                     continue
+                self.queued_reconciliations.add(workload_key)
+            dispatcher.submit(workload_key, lambda claim, key=workload_key: self.reconcile_tracked_workload(key))
+
+    def reconcile_tracked_workload(self, workload_key):
+        """Periodic reconciliation of one workload; failures are retried later."""
+        with self.state_lock:
+            self.queued_reconciliations.discard(workload_key)
+            if workload_key not in self.last_usage_actions:
+                return
+        # A failure for one workload must not starve later workloads.
+        try:
+            view = self.observe_workload(workload_key)
+            if view is None:
+                self.cleanup_workload(workload_key)
+                return
+            with self.state_lock:
                 if self.last_signatures.get(workload_key) == view.signature:
-                    continue
-                self.reconcile_workload(workload_key, view.keys, view.pods, view.signature)
-            except Exception as error:
+                    return
+            self.reconcile_workload(workload_key, view.keys, view.pods, view.signature)
+        except Exception as error:
+            with self.state_lock:
                 self.retry_workloads.add(workload_key)
-                self.emit(kind='error', message=str(error), action='periodic-reconciliation',
-                          namespace=workload_key[0], resource=workload_key[1])
+            self.emit(kind='error', message=str(error), action='periodic-reconciliation',
+                      namespace=workload_key[0], resource=workload_key[1])
 
     def observe_workload(self, workload_key):
         """Cached view of a workload, or None when its deployment is gone.
@@ -287,7 +396,8 @@ class UsageManager(multiprocessing.Process):
 
         namespace, name = workload_key
 
-        last_usage_action = self.last_usage_actions.get(workload_key)
+        with self.state_lock:
+            last_usage_action = self.last_usage_actions.get(workload_key)
 
         if emulated_pods is None:
             view = self.observe_workload(workload_key)
@@ -313,9 +423,10 @@ class UsageManager(multiprocessing.Process):
 
         self.apply_assignment(workload_key, assignment)
         # Commit the observed topology only after every mutation succeeded.
-        self.last_emulated_pods[workload_key] = emulated_pods
-        if signature is not None:
-            self.last_signatures[workload_key] = signature
+        with self.state_lock:
+            self.last_emulated_pods[workload_key] = emulated_pods
+            if signature is not None:
+                self.last_signatures[workload_key] = signature
         return APPLIED if assignment else EMPTY
 
     # --------------------------------------------------
@@ -357,22 +468,32 @@ class UsageManager(multiprocessing.Process):
             )
             pending.append((cru_name, body))
 
-        if self.usage_executor is None:
-            for name, body in pending:
-                self.apply_cru(name, body)
-        else:
-            futures = [self.usage_executor.submit(self.apply_cru, name, body) for name, body in pending]
-            failure = None
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as error:
-                    failure = failure or error
-            if failure is not None:
-                raise failure
+        self.run_mutations(workload_key, [(self.apply_cru, name, body) for name, body in pending])
 
         self.delete_stale_crus(workload_key, desired_crus)
-        self.managed_crus_by_workload[workload_key] = desired_crus
+        with self.state_lock:
+            self.managed_crus_by_workload[workload_key] = desired_crus
+
+    def run_mutations(self, workload_key, calls):
+        """Run CRU mutations on the shared bounded writer and wait for all of them.
+
+        The first failure is raised only after every call finished, so no write
+        of this workload is still in flight when its outcome is reported.
+        """
+        if self.usage_executor is None:
+            for function, *args in calls:
+                function(*args)
+            return
+        futures = [self.usage_executor.submit(function, *args, group=workload_key)
+                   for function, *args in calls]
+        failure = None
+        for future in futures:
+            try:
+                future.result()
+            except Exception as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
     # --------------------------------------------------
     # K8s API calls
@@ -384,7 +505,9 @@ class UsageManager(multiprocessing.Process):
         """
 
         try:
-            if cru_name in self.existing_crus:
+            with self.state_lock:
+                exists = cru_name in self.existing_crus
+            if exists:
                 self.api_call('patch-usage', self.k8s_api.patch_cluster_custom_object,
                     group=self.CRU_GROUP,
                     version=self.CRU_VERSION,
@@ -399,7 +522,8 @@ class UsageManager(multiprocessing.Process):
                     version=self.CRU_VERSION,
                     plural=self.CRU_PLURAL,
                 )
-                self.existing_crus.add(cru_name)
+                with self.state_lock:
+                    self.existing_crus.add(cru_name)
 
         except Exception as e:
             raise RuntimeError(f"Failed to apply usage for CRU {cru_name}: {e}") from e
@@ -417,11 +541,13 @@ class UsageManager(multiprocessing.Process):
                 name=cru_name,
             )
             self.log(f"[INFO] Deleted CRU {cru_name}")
-            self.existing_crus.discard(cru_name)
+            with self.state_lock:
+                self.existing_crus.discard(cru_name)
 
         except ApiException as e:
             if e.status == 404:  # if 404, then CRU already no longer exists
-                self.existing_crus.discard(cru_name)
+                with self.state_lock:
+                    self.existing_crus.discard(cru_name)
             else:
                 raise
 
@@ -469,23 +595,25 @@ class UsageManager(multiprocessing.Process):
         needed after a pod-set change.
         """
 
-        previous_crus = self.managed_crus_by_workload.get(workload_key, set())
+        with self.state_lock:
+            previous_crus = self.managed_crus_by_workload.get(workload_key, set())
         stale_crus = previous_crus - desired_crus
 
-        for cru_name in stale_crus:
-            self.delete_cru(cru_name)
+        self.run_mutations(workload_key, [(self.delete_cru, name) for name in sorted(stale_crus)])
 
 
     def cleanup_workload(self, workload_key):
         """
         Remove all related state and CRUs for a workload.
         """
-        for cru_name in self.managed_crus_by_workload.get(workload_key, set()):
-            self.delete_cru(cru_name)
+        with self.state_lock:
+            managed = sorted(self.managed_crus_by_workload.get(workload_key, set()))
+        self.run_mutations(workload_key, [(self.delete_cru, name) for name in managed])
 
-        self.last_usage_actions.pop(workload_key, None)
-        self.last_emulated_pods.pop(workload_key, None)
-        self.last_signatures.pop(workload_key, None)
-        self.retry_workloads.discard(workload_key)
-        self.managed_crus_by_workload.pop(workload_key, None)
+        with self.state_lock:
+            self.last_usage_actions.pop(workload_key, None)
+            self.last_emulated_pods.pop(workload_key, None)
+            self.last_signatures.pop(workload_key, None)
+            self.retry_workloads.discard(workload_key)
+            self.managed_crus_by_workload.pop(workload_key, None)
         self.assignment_engine.cleanup_workload(workload_key)

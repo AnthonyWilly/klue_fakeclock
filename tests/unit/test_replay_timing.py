@@ -33,6 +33,7 @@ def manager(cls, entries, factor=1, phase='dynamic'):
     result.hpa = False
     result.create_namespace_if_not_exists = Mock()
     result.usage_lock = threading.RLock()
+    result.usage_admission_lock = threading.Lock()
     result.usage_queue = Mock()
     result.check_usage = Mock()
     result.usage_progress = dict(enqueued=0, pending=0)

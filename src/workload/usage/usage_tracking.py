@@ -60,6 +60,13 @@ class UsageTracker:
         self.max_pending = max(self.max_pending, len(self.pending))
         return event_id
 
+    def withdraw(self, event_id):
+        """Undo the latest registration of an event that was never delivered."""
+        if event_id != self.next_event_id - 1 or event_id not in self.pending or event_id in self.active:
+            raise ValueError(f'usage event {event_id!r} cannot be withdrawn')
+        del self.pending[event_id]
+        self.next_event_id -= 1
+
     def started(self, message):
         event_id = message.get('event_id')
         if event_id not in self.pending or event_id in self.active:

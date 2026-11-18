@@ -131,8 +131,8 @@ changing the requested factor or shifting later deadlines. Static modes still
 wait through the trace duration. API, readiness and cleanup timeouts remain in
 real seconds. Independent node and workload applications use the same bounded
 worker policy as binds. Namespaces precede their objects; all application failures
-reach the coordinator. KWOK worker settings, client QPS/burst and the four usage
-writes per event remain unchanged. Setup capacity is a limit, not a promised
+reach the coordinator. KWOK worker settings, client QPS/burst and the global limit
+of four concurrent usage writes remain unchanged. Setup capacity is a limit, not a promised
 speedup: preparation and total runtime need not accelerate proportionally.
 
 Creation waits up to 600 real seconds for the exact expected fake node identities
@@ -164,7 +164,10 @@ reconciliation every 5 seconds, KWOK scrape every 15 seconds, and the main
 kube-state-metrics scrape and query grid every 30 seconds. For 1×/2×/5×,
 KWOK uses 15/7.5/3 real seconds and queries use 30/15/6 real seconds.
 Reconciliation runs on monotonic deadlines even while usage events arrive
-continuously. Every event is processed in queue order.
+continuously. Events and reconciliations of one workload are processed in queue
+order; independent workloads run concurrently on `min(8, ceil(F))` event
+workers, sharing a global limit of four usage writes. At most 1024 usage events
+are pending at once; producers wait for acknowledgements beyond that.
 
 The usage worker reads emulated pods and deployments from an in-memory
 list/watch cache that is ready before it accepts events. Reconciliation ticks

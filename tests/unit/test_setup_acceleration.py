@@ -88,7 +88,7 @@ def test_failed_identity_does_not_apply_its_later_operations():
     assert [call.args[0]['metadata']['name'] for call in apply.call_args_list] == ['a', 'b']
 
 
-def test_namespaces_precede_objects_and_usage_keeps_fifo():
+def test_namespaces_precede_objects_and_usage_is_submitted_in_trace_order():
     result = workload()
     result.data = {'setup': {'applied_objects': {'ns': [obj()], 'other': [obj('other', 'other')]},
         'workload_actions': [{'action': 'set-usage', 'name': 'first'}, {'action': 'set-usage', 'name': 'second'}]}}
