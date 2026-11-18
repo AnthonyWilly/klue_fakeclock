@@ -131,7 +131,11 @@ changing the requested factor or shifting later deadlines. Static modes still
 wait through the trace duration. API, readiness and cleanup timeouts remain in
 real seconds. Independent node and workload applications use the same bounded
 worker policy as binds. Namespaces precede their objects; all application failures
-reach the coordinator. KWOK worker settings, client QPS/burst and the global limit
+reach the coordinator. Without HPA or Karpenter, nodes, workloads and usage are
+replayed instant by instant: usage of an instant must be acknowledged before any
+later topology change and before the deletions of that instant, and a usage
+event completing more than 30 logical seconds after its instant fails the run.
+KWOK worker settings, client QPS/burst and the global limit
 of four concurrent usage writes remain unchanged. Setup capacity is a limit, not a promised
 speedup: preparation and total runtime need not accelerate proportionally.
 
@@ -277,7 +281,8 @@ Timing separates preparation, replay and finalization, including an explicit
 remains inclusive; within it, `producers_real` runs from the common origin until
 the infrastructure and workload replays have issued every action, and
 `usage_drain_real` is the subsequent wait for the remaining usage
-acknowledgements. After an interruption during that wait, `usage_drain_real`
+acknowledgements. Coordinated replays also record `usage_barrier_real`, the part
+of `producers_real` spent waiting for usage between instants. After an interruption during that wait, `usage_drain_real`
 holds the elapsed part. Usage progress separates outcomes (`applied`, `empty`,
 `target_absent`, `failed`, `cancelled`), acknowledgement watermark, gaps, active
 and pending events, the oldest pending event and per-event execution time;
@@ -287,7 +292,9 @@ See `docs/ACCELERATION.md` for their exact meaning. The effective
 factor divides scheduled logical duration by real replay duration and excludes
 the tail and preparation/finalization. Incomplete replays have no effective
 factor. Unstarted timing fields are null. These are operational diagnostics; the
-report makes no fidelity judgment. SIGINT/SIGTERM attempt orderly cleanup;
+report makes no judgment of curve fidelity. Its additive `fidelity` field only
+records the temporal usage limit of coordinated replays, its first violation and
+whether the replay stayed within it. SIGINT/SIGTERM attempt orderly cleanup;
 SIGKILL, machine loss or unavailable storage may leave the initial `running`
 report without a final result.
 

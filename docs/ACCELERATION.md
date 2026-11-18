@@ -74,8 +74,66 @@ execution; setup events have no replay deadline and are excluded from it.
 maxima, and the oldest pending event with its age past its deadline (or since
 submission for setup events). Maxima of that age are sampled whenever the
 coordinator reads worker status. Only aggregates and one worst example are
-recorded; individual acknowledgements are not exported. These are measurements:
-lateness is reported but does not by itself fail the run.
+recorded; individual acknowledgements are not exported. With HPA or Karpenter
+(1× only) these remain measurements: lateness is reported but does not by itself
+fail the run. Without autoscalers, the limit below applies.
+
+## Coordinated replay and the usage completion limit
+
+Without HPA or Karpenter, at 1× and at higher factors, one coordinator replays
+infrastructure and workloads together over the ordered union of their
+timestamps, from the common origin. For each instant it waits for the original
+deadline, creates nodes, applies workload objects and then scale actions,
+publishes every set-usage event of the instant, waits until each of those event
+ids has a terminal acknowledgement, deletes workloads and finally deletes nodes.
+Usage of an instant therefore completes before any later topology change and
+before the deletions of its own instant. The barrier is the set of event ids,
+never the highest id or a queue size. Waiting for a barrier makes the next
+instant start late but never moves its deadline. Entries keep their input order
+within each category and are all counted, including empty and not applicable
+ones; static producers still wait through the trace duration. Independent
+workloads still run in parallel in the usage worker. With HPA or Karpenter,
+autoscalers change topology outside the trace, so the two producers keep
+running independently at 1×.
+
+Each coordinated usage event carries the topology its workload must show,
+taken from the API response of the last confirmed mutation (deployment UID,
+generation and replicas; workloads from setup are only required to exist) or
+the expected absence after a deletion. The worker applies the event only after
+its LIST/WATCH cache shows that topology, including as many live pods as
+replicas; a cache older than the creation or scale is awaited, never read as an
+empty assignment. A deployment that stays missing, unexpected or with another
+UID for ten real seconds is a fidelity failure even with budget left. An
+expected absence is legitimate and recorded as `target_absent`. No read is
+issued per event.
+
+More than 30 logical seconds between an instant and the completion of one of its
+usage events fails the replay; exactly 30 s is valid. At 2× this is 15 real
+seconds. The limit covers queue wait, topology observation and every write of
+the event, and holds while an event has produced no acknowledgement: events
+admitted, buffered, waiting for topology or running are checked by age. The
+worker never waits past the deadline and issues no further write for an expired
+event. On the first violation the coordinator stops admission and every later
+action, cancels the replay and records the primary error with the event id,
+workload, trace instant, real and logical delay, limit and pending count. The
+run ends `failed` with `replay_complete: false`; queued events are not reported
+as applied, and late acknowledgements cannot make the run valid. A machine that
+cannot sustain the requested factor is expected to fail this way instead of
+finishing a backlog late. Setup events have no replay deadline.
+
+An acknowledgement confirms the API calls, not that the KWOK exporter already
+serves the new value: collection readiness, the export watermark and historical
+freshness checks still apply. `configuration.replay_coordination` is
+`instant_barriers` or `independent_producers` and
+`configuration.usage_completion_limit_logical` holds the limit (null without
+coordination). The additive `fidelity` field holds the limit, the first
+`violation` and `temporal_valid`, true only for a complete replay without
+violation. `progress.coordination` counts instants, usage instants and events,
+the barrier wait (total, maximum and worst instant) and the maximum start lag of
+an instant; `timing.usage_barrier_real` is the barrier wait within
+`producers_real`, and `usage_drain_real` the wait left after the last instant,
+which is near zero in a valid coordinated run. The collection tail is measured
+separately by `tail_real` and the `final_collection` phase.
 
 Final collection distinguishes node deletion from missing monitoring. It tracks
 initial nodes and successfully completed infrastructure replay actions, checks
@@ -208,11 +266,14 @@ by the existing scripts are external prerequisites.
 2. Inspect each `run.json`: `status`, `errors`, `warnings`, `progress`, `lag`,
    `collection` and `observability`. Check event counts, usage acknowledgements,
    queue completion, missing query evaluations, stale scrapes, collection errors
-   and application/reconciliation lag. Statuses are `running`, `completed`,
+   and application/reconciliation lag. Check `fidelity` (no violation,
+   `temporal_valid: true`), `progress.coordination` and the outcome counts: no
+   `failed`, `cancelled` or unexpected `target_absent` event. Statuses are `running`, `completed`,
    `completed_with_warnings`, `failed` or `interrupted`. A successful API call
    does not prove convergence. A completed run is not automatically faithful.
 
-3. Record `timing.preparation_real`, `replay_real`, `tail_real`,
+3. Record `timing.preparation_real`, `replay_real`, `producers_real`,
+   `usage_barrier_real`, `usage_drain_real`, `tail_real`,
    `finalization_real`, `total_real`, the requested factor and `effective_factor`.
    The effective factor is scheduled logical duration divided by real replay
    duration, excluding preparation, observation tail and finalization. It is null
