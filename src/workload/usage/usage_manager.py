@@ -138,7 +138,15 @@ class UsageManager(multiprocessing.Process):
         started = time.monotonic()
         failed = False
         try:
-            return function(_request_timeout=self.TIME_OUT, **kwargs)
+            timeout = self.TIME_OUT
+            deadline = getattr(self.event_scope, 'deadline', None)
+            if deadline is not None:
+                monotonic = getattr(self.event_scope, 'monotonic', None) or time.monotonic
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise ReplayFidelityError('usage deadline expired before API call')
+                timeout = min(timeout, remaining)
+            return function(_request_timeout=timeout, **kwargs)
         except Exception:
             failed = True
             raise
@@ -558,10 +566,11 @@ class UsageManager(multiprocessing.Process):
             for function, *args in calls:
                 function(*args)
             return
-        futures = [self.usage_executor.submit(function, *args, group=workload_key)
-                   for function, *args in calls]
         deadline = getattr(self.event_scope, 'deadline', None)
         monotonic = getattr(self.event_scope, 'monotonic', None) or time.monotonic
+        futures = [self.usage_executor.submit(self.run_mutation, function, args, deadline, monotonic,
+                                              group=workload_key)
+                   for function, *args in calls]
         failure = None
         for future in futures:
             try:
@@ -583,6 +592,16 @@ class UsageManager(multiprocessing.Process):
                 failure = failure or error
         if failure is not None:
             raise failure
+
+    def run_mutation(self, function, args, deadline, monotonic):
+        """Carry the event budget into its writer thread without leaking it."""
+        previous = (getattr(self.event_scope, 'deadline', None),
+                    getattr(self.event_scope, 'monotonic', None))
+        self.event_scope.deadline, self.event_scope.monotonic = deadline, monotonic
+        try:
+            return function(*args)
+        finally:
+            self.event_scope.deadline, self.event_scope.monotonic = previous
 
     # --------------------------------------------------
     # K8s API calls
@@ -614,6 +633,8 @@ class UsageManager(multiprocessing.Process):
                 with self.state_lock:
                     self.existing_crus.add(cru_name)
 
+        except ReplayFidelityError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to apply usage for CRU {cru_name}: {e}") from e
 

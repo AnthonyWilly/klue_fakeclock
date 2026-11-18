@@ -97,7 +97,7 @@ class WorkloadManager:
                     objects.append(obj)
         workers = getattr(self, 'setup_concurrency', 1)
         with setup_phase(self, 'workloads_apply', parent='workloads', expected=len(objects), concurrency=workers, unit='operations'):
-            apply_independent(objects, self.k8s_object_applier.apply_object, workers,
+            apply_independent(objects, self.apply_setup_object, workers,
                               lambda count: setup_progress(self, 'workloads_apply', completed=count))
 
         with setup_phase(self, 'workloads_converge', parent='workloads', unit='observed_pods'):
@@ -118,6 +118,14 @@ class WorkloadManager:
                     continue
                 completed += 1
                 setup_progress(self, 'initial_usage', completed=completed)
+
+    def apply_setup_object(self, obj):
+        response = self.k8s_object_applier.apply_object(obj)
+        if hasattr(self, 'topology') and obj.get('kind', '').lower() == 'deployment':
+            metadata = obj['metadata']
+            self.observe_mutation((metadata.get('namespace', 'default'), metadata['name']),
+                                  response, obj.get('spec', {}).get('replicas', 1))
+        return response
 
     def before_emulation(self):
         if not self.hpa:

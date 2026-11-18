@@ -465,6 +465,60 @@ def test_expired_event_issues_no_further_write():
 
 # ------------------------------------------------------------------ accounting
 
+def test_setup_records_api_identity_before_replay():
+    run = build([], [], setup=('app',))
+    workload = run.workload
+    workload.data['setup']['workload_actions'] = []
+    workload.BEFORE_EMULATION_KINDS = {'horizontalpodautoscaler'}
+    workload.k8s_api.list_pod_for_all_namespaces.return_value = NS(items=[])
+    workload.wait_pods_created = Mock()
+    workload.setup()
+    assert workload.expected_topology(('ns', 'app')) == dict(
+        present=True, uid='uid-app', generation=1, replicas=1)
+
+
+@pytest.mark.parametrize('deadline,expected_timeout', [(15, 5), (510, 200)])
+def test_mutation_api_timeout_uses_event_budget_in_writer_thread(deadline, expected_timeout):
+    worker = usage_worker(None)
+    worker.usage_executor = FairExecutor(1)
+    worker.event_scope.deadline = deadline
+    worker.event_scope.monotonic = lambda: 10
+    call = Mock()
+    try:
+        worker.run_mutations(('ns', 'app'), [(worker.api_call, 'fake-write', call)])
+    finally:
+        assert worker.usage_executor.shutdown(5)
+    call.assert_called_once_with(_request_timeout=expected_timeout)
+
+
+def test_expired_event_does_not_issue_an_api_call():
+    worker = usage_worker(None)
+    worker.event_scope.deadline = 9
+    worker.event_scope.monotonic = lambda: 10
+    call = Mock()
+    with pytest.raises(ReplayFidelityError):
+        worker.api_call('fake-write', call)
+    call.assert_not_called()
+    with pytest.raises(ReplayFidelityError):
+        worker.apply_cru('usage-expired', {})
+    worker.k8s_api.create_infrastructure_object.assert_not_called()
+
+
+def test_writer_reuse_does_not_leak_event_deadline():
+    worker = usage_worker(None)
+    worker.usage_executor = FairExecutor(1)
+    worker.event_scope.deadline = 15
+    worker.event_scope.monotonic = lambda: 10
+    call = Mock()
+    try:
+        worker.run_mutations(('ns', 'app'), [(worker.api_call, 'fake-write', call)])
+        worker.event_scope.deadline = None
+        worker.run_mutations(('ns', 'app'), [(worker.api_call, 'fake-write', call)])
+    finally:
+        assert worker.usage_executor.shutdown(5)
+    assert [entry.kwargs['_request_timeout'] for entry in call.call_args_list] == [5, 200]
+
+
 def test_tracker_limit_boundary_pending_and_setup_events():
     now = [100.0]
     tracker = UsageTracker(lambda: now[0], limit_logical=30)
