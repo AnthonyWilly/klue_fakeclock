@@ -8,7 +8,7 @@ measured from the common monotonic origin. For each instant:
 2. create nodes;
 3. apply workload objects, then scale and other non-usage actions;
 4. publish every set-usage event of the instant, each carrying the topology
-   its workload must show and its completion deadline;
+   its workload is expected to show;
 5. wait until every one of those event ids has a terminal acknowledgement;
 6. delete workloads, then delete nodes.
 
@@ -18,9 +18,8 @@ still run in parallel in the usage worker. Entries keep their input order and
 are all counted, including empty and not applicable ones.
 
 The barrier is the set of event ids, never the highest id or a queue size.
-More than ``limit_logical`` logical seconds between an instant and the
-completion of one of its usage events fails the replay: the parent raises the
-first violation from ``WorkloadManager.check_usage`` and nothing after it runs.
+``limit_logical`` is a diagnostic warning threshold. Lateness does not stop
+the trace; API/process/protocol failures and real inactivity remain errors.
 """
 import time
 
@@ -83,16 +82,25 @@ class ReplayCoordinator:
             self.stats['processed_instants'] += 1
 
     def barrier(self, events, clock, timestamp):
-        """Wait for every event id; deadlines, cancellation and worker health are checked."""
+        """Wait for every event id, checking cancellation and operational health."""
         cancel = getattr(clock, 'cancel', None)
         started = clock.monotonic()
+        last_progress, previous = started, None
         while True:
-            # Raises on the first temporal violation or a dead usage worker.
+            # A dead or stalled worker is an operational failure; lateness is not.
             self.workload.check_usage()
             if self.workload.usage_done(events):
                 break
             if cancel is not None and cancel.is_set():
                 raise InterruptedError('replay cancelled while waiting for usage')
+            progress = self.workload.usage_progress
+            current = (progress['completed'], progress['failed'],
+                       getattr(self.workload, 'usage_activity', 0))
+            now = clock.monotonic()
+            if current != previous:
+                previous, last_progress = current, now
+            if now - last_progress >= self.workload.TIME_OUT + 30:
+                raise RuntimeError('UsageManager made no progress within real inactivity deadline')
             if cancel is not None and clock.wait is time.sleep:
                 cancel.wait(self.poll)
             else:

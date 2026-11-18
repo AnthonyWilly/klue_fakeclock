@@ -197,8 +197,7 @@ class WorkloadManager:
             event = dict(action, replay_timing=timing)
             limit = self.usage_tracker.limit_logical
             if limit is not None:
-                # The worker waits for this topology and never past this deadline.
-                timing['usage_deadline_monotonic'] = scheduled + limit / clock.speed_factor
+                # Expectations are diagnostic; they never impose a logical timeout.
                 event['expected_topology'] = self.expected_topology(
                     (action.get('namespace'), action.get('name')))
             sink = delivered if delivered is not None else []
@@ -225,7 +224,7 @@ class WorkloadManager:
     # ------------------------------------------------------------ topology
 
     def coordinate(self, limit_logical):
-        """Enable usage deadlines and topology expectations for the replay.
+        """Enable diagnostic timing thresholds and topology expectations.
 
         Expectations start from the setup deployments and follow every
         confirmed mutation: the API response gives UID, generation and
@@ -335,6 +334,11 @@ class WorkloadManager:
             elif kind == 'cache':
                 # Observation counters only; they do not prove usage progress.
                 progress['resource_cache'] = message['stats']
+            elif kind == 'fidelity-warning':
+                progress['fidelity_warning_count'] = progress.get('fidelity_warning_count', 0) + 1
+                warnings = progress.setdefault('fidelity_warnings', [])
+                if len(warnings) < 100:
+                    warnings.append(message)
             elif kind == 'activity':
                 progress.setdefault('api', {})[message['action']] = message['stats']
                 self.usage_activity = getattr(self, 'usage_activity', 0) + 1
@@ -343,10 +347,6 @@ class WorkloadManager:
         tracker.check_deadlines()
         progress['pending'] = len(tracker.pending)
         progress.update(tracker.summary())
-        if tracker.violation is not None and not getattr(self, 'fidelity_raised', False):
-            # Raised once; cleanup and archive keep running after the primary failure.
-            self.fidelity_raised = True
-            raise tracker.violation_error()
         if self.usage_manager.pid is not None and self.usage_manager.exitcode is not None:
             if self.usage_manager.exitcode != 0:
                 raise RuntimeError(f'UsageManager exited with code {self.usage_manager.exitcode}')

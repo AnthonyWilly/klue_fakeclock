@@ -11,8 +11,8 @@ completion lag; their queue age is measured from submission.
 
 With a completion limit, an event of the replay violates temporal fidelity when
 it completes, or is still pending, more than ``limit_logical`` logical seconds
-after its scheduled instant. Exactly the limit is still valid. Only the first
-violation is kept: it is the primary diagnosis of the run.
+after its scheduled instant. This is a diagnostic observation, not a stop
+condition or an automatic fidelity verdict. Only the first observation is kept.
 """
 import copy
 import time

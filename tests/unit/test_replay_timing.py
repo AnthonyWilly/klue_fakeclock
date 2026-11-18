@@ -264,7 +264,9 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
             components[name].emulation.assert_called_once_with(clock)
     else:
         assert configuration['replay_coordination'] == 'instant_barriers'
-        assert configuration['usage_completion_limit_logical'] == 30
+        assert configuration['usage_completion_limit_logical'] is None
+        assert configuration['usage_warning_threshold_logical'] == 30
+        assert configuration['fidelity_policy'] == 'advisory'
         components['WorkloadManager'].coordinate.assert_called_once_with(30)
         for name in ('InfrastructureManager', 'WorkloadManager'):
             components[name].emulation.assert_not_called()

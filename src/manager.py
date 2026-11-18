@@ -69,7 +69,8 @@ class Manager:
             self.workload_manager.coordinate(self.replay_coordinator.limit_logical)
         self.report.update(configuration=dict(self.report.data['configuration'],
             replay_coordination='instant_barriers' if self.replay_coordinator else 'independent_producers',
-            usage_completion_limit_logical=self.replay_coordinator.limit_logical if self.replay_coordinator else None))
+            usage_completion_limit_logical=None, fidelity_policy='advisory',
+            usage_warning_threshold_logical=self.replay_coordinator.limit_logical if self.replay_coordinator else None))
 
         self.report.trace(PodsMapping.PODS_ALLOCATION_PATH, 'allocation')
         self.pods_mapping = PodsMapping(karpenter)
@@ -237,6 +238,10 @@ class Manager:
         with self.workload_manager.usage_lock:
             usage = copy.deepcopy(self.workload_manager.usage_progress)
         usage_errors = usage.pop('errors')
+        fidelity_warnings = usage.pop('fidelity_warnings', [])
+        for warning in fidelity_warnings if final else ():
+            context = {key: value for key, value in warning.items() if key not in ('kind', 'message')}
+            self.report.issue(warning['message'], warning=True, component='usage', stage='replay', **context)
         for error in usage_errors if final else ():
             context = {key: value for key, value in error.items() if key not in ('kind', 'message', 'completed')}
             self.report.issue(error.get('message', 'usage reconciliation failed'),
@@ -261,12 +266,13 @@ class Manager:
             if self.clock.origin_monotonic is not None:
                 # Part of producers_real: time spent waiting for usage between instants.
                 self.report.timing(usage_barrier_real=progress['coordination']['barrier_wait_real'])
-            violation = fidelity.get('violation')
-            # Additive field: status/replay_complete keep their meaning for consumers.
+            observation = fidelity.get('violation')
+            if final and observation is not None:
+                self.report.issue('Usage timing exceeded the diagnostic threshold; inspect the graphs',
+                                  warning=True, component='usage', stage='replay', observation=observation)
             self.report.update(fidelity=dict(
-                limit_logical=fidelity.get('limit_logical'), violation=violation,
-                temporal_valid=bool(final and violation is None
-                                    and self.report.data['timing'].get('replay_complete'))))
+                policy='advisory', assessment='manual', temporal_valid=None,
+                warning_threshold_logical=fidelity.get('limit_logical'), first_observation=observation))
         if self.clock.origin_monotonic is not None and not final:
             self.report.timing(progress_logical=max(
                 progress[name]['final_timestamp'] or 0 for name in ('infrastructure', 'workload')))
@@ -393,7 +399,6 @@ class Manager:
             usage = self.workload_manager.usage_progress
             complete = (not usage['failed'] and not usage['errors']
                         and not usage.get('outcomes', {}).get('cancelled')
-                        and not (usage.get('fidelity') or {}).get('violation')
                         and all(not manager.replay_diagnostics.snapshot()['failed_actions']
                                 for manager in (self.infrastructure_manager, self.workload_manager)))
             report.timing(replay_real=replay_end - self.clock.origin_monotonic,

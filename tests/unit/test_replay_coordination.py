@@ -198,7 +198,7 @@ def test_usage_barrier_orders_topology_and_keeps_original_deadlines():
     assert first['expected_topology'] == dict(present=True, uid='uid-app', generation=1, replicas=2)
     # The scale response confirms replicas; its identity keeps the known generation.
     assert second['expected_topology'] == dict(present=True, uid='uid-app', generation=1, replicas=3)
-    assert first['replay_timing']['usage_deadline_monotonic'] == 100 + 30 / 2
+    assert 'usage_deadline_monotonic' not in first['replay_timing']
     assert second['replay_timing']['scheduled_monotonic'] == 105
     stats = run.workload.replay_diagnostics.snapshot()
     assert stats['processed_entries'] == 2
@@ -259,54 +259,45 @@ def test_exactly_the_limit_is_valid(factor):
 
 
 @pytest.mark.parametrize('factor', [1, 2])
-def test_completion_beyond_limit_stops_replay_with_primary_diagnosis(factor):
+def test_completion_beyond_threshold_continues_all_instants(factor):
     run = build([{'timestamp': 0}, {'timestamp': 10, 'applied_objects': [{'kind': 'Node', 'metadata': {'name': 'n'}}]}],
                 [{'timestamp': 0, 'workload_actions': [usage('x')],
                   'deleted_objects': [{'kind': 'Deployment', 'name': 'x', 'namespace': 'ns'}]},
                  {'timestamp': 10, 'applied_objects': {'ns': [deployment('later')]}}],
                 factor=factor, setup=['x'], duration=lambda event: 31 / factor)
-    with pytest.raises(ReplayFidelityError, match='temporal fidelity violated') as raised:
-        run.coordinator.run(run.clock)
-    details = raised.value.details
-    assert details['event_id'] == 1 and details['resource'] == 'x' and details['trace_timestamp'] == 0
-    assert details['limit_logical'] == 30
-    assert 30 < details['delay_logical'] <= 30 + .05 * factor
-    assert details['reason'] == 'pending' and details['state'] == 'active'
-    # Neither the deletion of the instant nor any future action ran.
-    assert names(run.log) == [('usage', 'x')]
+    run.coordinator.run(run.clock)
+    assert run.workload.usage_progress['completed'] == 1
+    assert run.workload.usage_progress['failed'] == 0
     assert run.workload.usage_progress['fidelity']['violation']['event_id'] == 1
-    # Later checks (cleanup) do not raise the same violation again.
-    run.time.wait(31)
-    run.workload.check_usage()
-    assert run.workload.usage_tracker.outcomes[APPLIED] == 1
+    assert ('delete', 'x') in names(run.log)
+    assert ('node+', 'n') in names(run.log) and ('apply', 'later') in names(run.log)
+    assert run.coordinator.stats['processed_instants'] == 2
 
 
-def test_event_never_started_fails_by_age():
+def test_stalled_worker_fails_by_real_inactivity_not_logical_lateness():
     run = build([], [{'timestamp': 0, 'workload_actions': [usage('a'), usage('b')]}],
                 setup=['a', 'b'], workers=1, duration=lambda event: None)
-    with pytest.raises(ReplayFidelityError) as raised:
+    with pytest.raises(RuntimeError, match='real inactivity'):
         run.coordinator.run(run.clock)
-    assert raised.value.details['state'] == 'active'
-    assert raised.value.details['pending'] == 2
-    assert run.time.now == pytest.approx(115, abs=.03)
+    assert run.time.now == pytest.approx(330, abs=.03)
+    assert run.workload.usage_tracker.violation['state'] == 'active'
 
 
-def test_queued_event_fails_by_age_when_worker_never_starts_it():
-    run = build([], [{'timestamp': 0, 'workload_actions': [usage('a')]}],
-                setup=['a'], workers=0)
-    with pytest.raises(ReplayFidelityError) as raised:
+def test_unstarted_event_waits_for_operational_inactivity_timeout():
+    run = build([], [{'timestamp': 0, 'workload_actions': [usage('a')]}], setup=['a'], workers=0)
+    with pytest.raises(RuntimeError, match='real inactivity'):
         run.coordinator.run(run.clock)
-    assert raised.value.details['state'] == 'queued'
+    assert run.time.now == pytest.approx(330, abs=.03)
+    assert run.workload.usage_tracker.violation['state'] == 'queued'
 
 
-def test_missing_target_fails_before_the_limit():
-    run = build([], [{'timestamp': 0, 'workload_actions': [usage('a')]}], setup=['a'],
-                outcome=lambda event: dict(outcome=FAILED, completed=False, fidelity=True,
-                                           message='ns/a: observed workload is missing'))
-    with pytest.raises(ReplayFidelityError, match='found no expected target') as raised:
-        run.coordinator.run(run.clock)
-    assert raised.value.details['reason'] == 'topology'
-    assert run.time.now == pytest.approx(101, abs=.03)
+def test_absent_target_does_not_abort_the_remaining_trace():
+    run = build([], [{'timestamp': 0, 'workload_actions': [usage('a')]},
+                     {'timestamp': 60, 'applied_objects': {'ns': [deployment('later')]}}],
+                setup=['a'], outcome=lambda event: dict(outcome=TARGET_ABSENT, completed=True))
+    run.coordinator.run(run.clock)
+    assert run.workload.usage_progress['failed'] == 0
+    assert ('apply', 'later') in names(run.log)
 
 
 def test_dead_worker_and_cancellation_end_the_barrier_without_future_actions():
@@ -328,27 +319,21 @@ def test_dead_worker_and_cancellation_end_the_barrier_without_future_actions():
     assert run.time.now < 101.1
 
 
-@pytest.mark.parametrize('duration, fails', [(.005, False), (.1, True)])
-def test_660_workloads_over_31_instants_preserve_every_event(duration, fails):
+@pytest.mark.parametrize('duration, observes_lateness', [(.005, False), (.1, True)])
+def test_660_workloads_over_31_instants_preserve_every_event(duration, observes_lateness):
     """2 workers at 2x: 660 events per 2.5 real s instant need <= 7.5 ms each."""
     workloads = [f'w{index}' for index in range(660)]
     entries = [{'timestamp': 5 * index, 'workload_actions': [usage(name) for name in workloads]}
                for index in range(31)]
     run = build([], entries, setup=workloads, duration=lambda event: duration, workers=2)
-    if fails:
-        with pytest.raises(ReplayFidelityError) as raised:
-            run.coordinator.run(run.clock)
-        assert raised.value.details['trace_timestamp'] == 0
-        assert len(run.worker.received) == 660  # Nothing of a later instant was admitted.
-        return
     run.coordinator.run(run.clock)
     tracker = run.workload.usage_tracker
     assert len(run.worker.received) == tracker.outcomes[APPLIED] == 31 * 660
     assert sorted(event['event_id'] for event in run.worker.received) == list(range(1, 31 * 660 + 1))
     assert tracker.protocol_errors == 0 and not tracker.pending
     assert tracker.max_pending == 660 <= WorkloadManager.USAGE_ADMISSION_LIMIT
-    assert tracker.violation is None
-    assert tracker.completion['max_logical'] <= 30
+    assert (tracker.violation is not None) == observes_lateness
+    assert (tracker.completion['max_logical'] > 30) == observes_lateness
     # Stable topology: usage never issues a workload read or list from the parent.
     assert not run.workload.k8s_api.mock_calls
     assert not run.workload.k8s_object_applier.mock_calls
@@ -401,47 +386,75 @@ def test_cache_older_than_creation_is_awaited_not_read_as_empty(caches):
     worker.k8s_api.read_namespaced_deployment.assert_not_called()
 
 
-def test_uid_mismatch_or_missing_target_fails_after_catch_up(caches):
+def test_uid_mismatch_and_missing_target_are_diagnostics(caches):
     cache = caches(deployments=[cached_deployment('app', uid='old')])
     worker = usage_worker(cache)
-    worker.CACHE_CATCH_UP_TIMEOUT = .1
-    with pytest.raises(ReplayFidelityError, match='uid-mismatch'):
-        worker.handle_set_usage_event(coordinated_event('app', dict(uid='new', replicas=0)))
-    with pytest.raises(ReplayFidelityError, match='missing'):
-        worker.handle_set_usage_event(coordinated_event('gone', dict(replicas=0)))
-    worker.apply_assignment.assert_not_called()
-    assert ('ns', 'app') in worker.retry_workloads
+    worker.CACHE_CATCH_UP_TIMEOUT = .01
+    worker.status_queue = queue.Queue()
+    assert worker.handle_set_usage_event(coordinated_event('app', dict(uid='new', replicas=0))) == 'empty'
+    assert worker.handle_set_usage_event(coordinated_event('gone', dict(replicas=0))) == TARGET_ABSENT
+    warnings = [worker.status_queue.get_nowait() for _ in range(worker.status_queue.qsize())]
+    assert len([m for m in warnings if m['kind'] == 'fidelity-warning']) == 2
+    assert ('ns', 'app') not in worker.retry_workloads
 
 
-def test_expected_absence_is_legitimate_but_an_unexpected_workload_is_not(caches):
+def test_unexpected_existing_workload_warns_without_stalling_or_failing(caches):
     cache = caches(deployments=[cached_deployment('present')])
     worker = usage_worker(cache)
-    worker.CACHE_CATCH_UP_TIMEOUT = .1
+    worker.status_queue = queue.Queue()
+    worker.resource_cache.wait_for = Mock(side_effect=AssertionError('must not wait for native workload to disappear'))
     worker.cleanup_workload = Mock()
     assert worker.handle_set_usage_event(coordinated_event('gone', dict(present=False))) == TARGET_ABSENT
-    worker.cleanup_workload.assert_called_once_with(('ns', 'gone'))
-    with pytest.raises(ReplayFidelityError, match='unexpected'):
-        worker.handle_set_usage_event(coordinated_event('present', dict(present=False)))
+    assert worker.handle_set_usage_event(coordinated_event('present', dict(present=False))) == 'empty'
+    warning = worker.status_queue.get_nowait()
+    assert warning['kind'] == 'fidelity-warning' and 'unexpected' in warning['message']
 
 
-def test_convergence_never_observed_fails_at_the_usage_deadline(caches):
+def test_incomplete_convergence_uses_observed_state_and_warns(caches):
     cache = caches(deployments=[cached_deployment('app')])
     worker = usage_worker(cache)
-    started = real_time.monotonic()
-    with pytest.raises(ReplayFidelityError, match='before the usage deadline'):
-        worker.handle_set_usage_event(coordinated_event('app', dict(replicas=3), budget=.2))
-    assert real_time.monotonic() - started < 5
+    worker.CACHE_CATCH_UP_TIMEOUT = .01
+    worker.status_queue = queue.Queue()
+    assert worker.handle_set_usage_event(coordinated_event('app', dict(replicas=3), budget=-1)) == 'empty'
+    assert worker.status_queue.get_nowait()['kind'] == 'fidelity-warning'
 
 
-def test_worker_reports_fidelity_failures_as_failed_outcome(caches):
+def test_worker_reports_missing_target_as_warning_and_successful_handling(caches):
     cache = caches()
     worker = usage_worker(cache)
-    worker.CACHE_CATCH_UP_TIMEOUT = .05
+    worker.CACHE_CATCH_UP_TIMEOUT = .01
     worker.status_queue = queue.Queue()
     worker.process_event(coordinated_event('gone', dict(replicas=1)), real_time.monotonic)
     messages = [worker.status_queue.get_nowait() for _ in range(worker.status_queue.qsize())]
     ack = messages[-1]
-    assert ack['kind'] == 'ack' and ack['outcome'] == FAILED and ack['fidelity'] is True
+    assert ack['kind'] == 'ack' and ack['outcome'] == TARGET_ABSENT and ack['completed']
+    assert any(m['kind'] == 'fidelity-warning' for m in messages)
+
+
+@pytest.mark.parametrize('name', ['coredns', 'metrics-server'])
+def test_native_kube_system_workload_does_not_abort_the_event(caches, name):
+    cache = caches(deployments=[cached_deployment(name, namespace='kube-system')])
+    worker = usage_worker(cache)
+    worker.status_queue = queue.Queue()
+    cache.wait_for = Mock(side_effect=AssertionError('native workload must not stall replay'))
+    event = coordinated_event(name, dict(present=False), budget=-1)
+    event['namespace'] = 'kube-system'
+    worker.process_event(event, real_time.monotonic)
+    messages = [worker.status_queue.get_nowait() for _ in range(worker.status_queue.qsize())]
+    assert messages[-1]['outcome'] == 'empty' and messages[-1]['completed']
+    assert any(m['kind'] == 'fidelity-warning' for m in messages)
+    assert not worker.k8s_api.mock_calls
+
+
+def test_real_usage_write_error_still_produces_failed_ack(caches):
+    cache = caches(pods=[cached_pod('p', 'app')], deployments=[cached_deployment('app')])
+    worker = usage_worker(cache)
+    worker.status_queue = queue.Queue()
+    worker.apply_assignment.side_effect = RuntimeError('API write refused')
+    worker.process_event(coordinated_event('app', dict(replicas=1)), real_time.monotonic)
+    messages = [worker.status_queue.get_nowait() for _ in range(worker.status_queue.qsize())]
+    assert messages[-1]['outcome'] == FAILED and not messages[-1]['completed']
+    assert messages[-1]['message'] == 'API write refused'
 
 
 def test_expired_event_issues_no_further_write():
@@ -549,19 +562,14 @@ def test_replay_without_limit_keeps_legacy_completion():
     assert tracker.violation is None
 
 
-def test_violation_while_waiting_for_admission_capacity_stops_replay(monkeypatch):
-    """A full admission wait still raises the violation instead of a failed action."""
+def test_lateness_while_waiting_for_capacity_does_not_drop_or_abort(monkeypatch):
     run = build([], [{'timestamp': 0, 'workload_actions': [usage('a'), usage('b'), usage('c')]}],
-                setup=['a', 'b', 'c'], duration=lambda event: None)
+                setup=['a', 'b', 'c'], duration=lambda event: 16)
     monkeypatch.setattr(WorkloadManager, 'USAGE_ADMISSION_LIMIT', 2)
-    now = run.time
-    monkeypatch.setattr('workload.manager.time.monotonic', now.monotonic)
-    run.workload.usage_manager.join = Mock()
-    cancel = run.clock.cancel
-    # The admission wait polls the cancel event; advance fake time instead.
-    monkeypatch.setattr(cancel, 'wait', lambda seconds: now.wait(seconds))
-    with pytest.raises(ReplayFidelityError):
-        run.coordinator.run(run.clock)
-    assert [entry[:2] for entry in run.log] == [('usage', 'a'), ('usage', 'b')]
-    actions = run.workload.replay_diagnostics.snapshot()['actions']
-    assert actions[-1]['completed'] is False and 'temporal fidelity' in actions[-1]['error']
+    monkeypatch.setattr('workload.manager.time.monotonic', run.time.monotonic)
+    monkeypatch.setattr(run.clock.cancel, 'wait', lambda seconds: run.time.wait(seconds))
+    run.coordinator.run(run.clock)
+    assert run.workload.usage_progress['completed'] == 3
+    assert run.workload.usage_progress['failed'] == 0
+    assert run.workload.usage_progress['pending'] == 0
+    assert run.workload.usage_tracker.violation is not None

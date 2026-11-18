@@ -133,8 +133,10 @@ real seconds. Independent node and workload applications use the same bounded
 worker policy as binds. Namespaces precede their objects; all application failures
 reach the coordinator. Without HPA or Karpenter, nodes, workloads and usage are
 replayed instant by instant: usage of an instant must be acknowledged before any
-later topology change and before the deletions of that instant, and a usage
-event completing more than 30 logical seconds after its instant fails the run.
+later topology change and before the deletions of that instant. Lateness and
+topology differences are diagnostic warnings: they do not stop the trace.
+The user evaluates fidelity from the exported curves; real API, process,
+protocol, collection and inactivity errors still fail the run.
 KWOK worker settings, client QPS/burst and the global limit
 of four concurrent usage writes remain unchanged. Setup capacity is a limit, not a promised
 speedup: preparation and total runtime need not accelerate proportionally.
@@ -293,8 +295,9 @@ factor divides scheduled logical duration by real replay duration and excludes
 the tail and preparation/finalization. Incomplete replays have no effective
 factor. Unstarted timing fields are null. These are operational diagnostics; the
 report makes no judgment of curve fidelity. Its additive `fidelity` field only
-records the temporal usage limit of coordinated replays, its first violation and
-whether the replay stayed within it. SIGINT/SIGTERM attempt orderly cleanup;
+records diagnostic timing observations with `assessment: manual` and
+`temporal_valid: null`. The 30-logical-second threshold is advisory, not an
+execution deadline or an automatic fidelity verdict. SIGINT/SIGTERM attempt orderly cleanup;
 SIGKILL, machine loss or unavailable storage may leave the initial `running`
 report without a final result.
 

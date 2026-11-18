@@ -731,33 +731,27 @@ def test_coordinated_replay_reports_barriers_and_temporal_validity(lifecycle):
     assert data['status'] == 'completed'
     assert data['timing']['replay_complete'] is True
     assert data['timing']['usage_barrier_real'] == 3
-    assert data['fidelity'] == dict(limit_logical=30, violation=None, temporal_valid=True)
+    assert data['fidelity'] == dict(policy='advisory', assessment='manual', temporal_valid=None, warning_threshold_logical=30, first_observation=None)
     assert data['progress']['coordination']['limit_logical'] == 30
     for manager in (result.infrastructure_manager, result.workload_manager):
         manager.emulation.assert_not_called()
 
 
-def test_fidelity_violation_fails_run_with_primary_error_and_finishes_cleanup(lifecycle):
-    from workload.usage.usage_tracking import UsageTracker
+def test_lateness_is_a_warning_and_a_complete_replay_is_not_failed(lifecycle):
     result, report, now = lifecycle
-    tracker = UsageTracker(lambda: 200, limit_logical=30)
-    tracker.register(dict(namespace='ns', name='app', event_id=1, replay_timing=dict(
-        scheduled_monotonic=100, speed_factor=2, trace_timestamp=20)))
-    tracker.check_deadlines()
-    coordinated(result, now, failure=tracker.violation_error())
-    with pytest.raises(RuntimeError, match='failed'):
-        result.run()
+    coordinated(result, now)
+    observation = dict(event_id=1, resource='app', delay_logical=200, limit_logical=30)
+    result.workload_manager.usage_progress['fidelity'] = dict(limit_logical=30, violation=observation)
+    result.workload_manager.usage_progress['fidelity_warnings'] = [
+        dict(kind='fidelity-warning', message='topology differs', event_id=1)]
+    result.run()
     data = json.loads(report.path.read_text())
-    assert data['status'] == 'failed'
-    assert data['timing']['replay_complete'] is False
-    assert data['timing']['effective_factor'] is None
-    primary = data['errors'][0]
-    assert primary['message'].startswith('temporal fidelity violated')
-    assert primary['component'] == 'replay'
-    assert (primary['event_id'], primary['trace_timestamp'], primary['limit_logical']) == (1, 20, 30)
-    assert primary['delay_logical'] == 200
-    assert data['fidelity']['temporal_valid'] is False
-    assert data['fidelity']['violation']['event_id'] == 1
+    assert data['status'] == 'completed_with_warnings'
+    assert data['errors'] == [] and data['timing']['replay_complete'] is True
+    assert data['fidelity']['temporal_valid'] is None
+    assert data['fidelity']['assessment'] == 'manual'
+    assert data['fidelity']['first_observation'] == observation
+    assert any(w['message'] == 'topology differs' for w in data['warnings'])
     result.workload_manager.tear_down.assert_called_once()
     assert (Path(result.output_dir + '.zip')).exists()
 
@@ -768,4 +762,4 @@ def test_cancelled_usage_is_never_a_complete_replay(lifecycle):
     result.workload_manager.usage_progress['outcomes'] = dict(applied=2, cancelled=1)
     result.run()
     assert report.data['timing']['replay_complete'] is False
-    assert report.data['fidelity']['temporal_valid'] is False
+    assert report.data['fidelity']['temporal_valid'] is None
