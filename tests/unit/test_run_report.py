@@ -40,6 +40,9 @@ def test_exclusive_output_atomic_updates_and_identity(tmp_path, monkeypatch):
     assert data['status'] == 'completed_with_warnings'
     assert data['timing']['total_real'] == 7
     assert data['timing']['replay_real'] is None
+    # Additive fields start null; legacy fields keep their names.
+    assert data['timing']['producers_real'] is None
+    assert data['timing']['usage_drain_real'] is None
     assert data['traces'][0]['sha256'] == hashlib.sha256(trace.read_bytes()).hexdigest()
     assert all(state == 'running' for state in seen)
     assert not list(report.output_dir.glob('.run-*.tmp'))

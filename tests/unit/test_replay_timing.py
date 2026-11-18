@@ -10,6 +10,7 @@ from experiment_clock import ReplayDiagnostics
 from infrastructure.manager import InfrastructureManager
 from workload.manager import WorkloadManager
 from workload.usage.usage_manager import UsageManager
+from workload.usage.usage_tracking import UsageTracker
 from util.k8s_object_applier import KubernetesObjectApplier
 from test_experiment_clock import FakeTime
 
@@ -35,6 +36,7 @@ def manager(cls, entries, factor=1, phase='dynamic'):
     result.usage_queue = Mock()
     result.check_usage = Mock()
     result.usage_progress = dict(enqueued=0, pending=0)
+    result.usage_tracker = UsageTracker()
     return result
 
 

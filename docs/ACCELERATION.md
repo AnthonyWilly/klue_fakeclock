@@ -35,6 +35,30 @@ deadlines. No event is coalesced or discarded. `run.json` usage progress include
 API operation counts, failures, total/max real duration and pod-write concurrency;
 these diagnostics allow capacity to be measured on the execution machine.
 
+Each delivered usage event receives a unique sequential `event_id`. The worker
+reports when it starts the event and exactly one terminal outcome: `applied`
+(every pod write succeeded), `empty` (the workload exists but has no emulated
+pod to receive usage), `target_absent` (the deployment is gone; removing its
+usage objects is cleanup, not application), `failed` or `cancelled`. `completed`
+keeps its previous meaning and counts the first three; only `applied` proves
+written usage, and `target_absent` produces a warning. A duplicate or unknown
+acknowledgement is a protocol error and fails the run without being counted
+again. Because outcomes may arrive out of order, the report keeps the
+contiguous `acknowledged_through` watermark separately from
+`highest_acknowledged` and counts the gaps between them.
+
+The existing `lag_real`/`lag_logical` fields still measure the delay until the
+worker starts an event. `lag.usage.completion_lag` measures replay events from
+their original deadline until their terminal outcome, including queue wait and
+execution; setup events have no replay deadline and are excluded from it.
+`progress.usage.execution` holds the per-event execution time, and
+`progress.usage.acknowledgements` holds active and pending counts, their
+maxima, and the oldest pending event with its age past its deadline (or since
+submission for setup events). Maxima of that age are sampled whenever the
+coordinator reads worker status. Only aggregates and one worst example are
+recorded; individual acknowledgements are not exported. These are measurements:
+lateness is reported but does not by itself fail the run.
+
 Final collection distinguishes node deletion from missing monitoring. It tracks
 initial nodes and successfully completed infrastructure replay actions, checks
 the current fake-node set, and requires scrape targets for live nodes. When the

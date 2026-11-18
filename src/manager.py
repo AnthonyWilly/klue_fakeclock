@@ -235,6 +235,10 @@ class Manager:
         if final and usage['late_events']:
             self.report.issue(f"{usage['late_events']} late usage reconciliations",
                               warning=True, component='usage', stage='replay')
+        absent = usage.get('outcomes', {}).get('target_absent')
+        if final and absent:
+            self.report.issue(f'{absent} usage events found no target workload; their usage was not applied',
+                              warning=True, component='usage', stage='replay')
         count = usage['completed']
         usage['mean_lag_real'] = usage['total_lag_real'] / count if count else 0
         usage['mean_lag_logical'] = usage['total_lag_logical'] / count if count else 0
@@ -260,6 +264,7 @@ class Manager:
         monitor_started = False
         interrupted = False
         finalization_start = None
+        producers_end = None
         replay_end = None
         thread_errors = queue.Queue()
         last_snapshot = self.clock.monotonic()
@@ -352,10 +357,13 @@ class Manager:
                     thread.join(.1)
                 check_threads()
             check_threads()
+            producers_end = self.clock.monotonic()
+            report.timing(producers_real=producers_end - self.clock.origin_monotonic)
             # Acknowledgements, not queue.put, establish replay completion.
             # Keep periodic reconciliation alive for pods converging in the tail.
             self.workload_manager.drain_usage(check=check_threads)
             replay_end = self.clock.monotonic()
+            report.timing(usage_drain_real=replay_end - producers_end)
             complete = (not self.workload_manager.usage_progress['failed']
                         and not self.workload_manager.usage_progress['errors']
                         and all(not manager.replay_diagnostics.snapshot()['failed_actions']
@@ -393,6 +401,9 @@ class Manager:
                               for manager in (self.infrastructure_manager, self.workload_manager)]
                 report.timing(replay_real=now - self.clock.origin_monotonic,
                               progress_logical=max(timestamps), effective_factor=None)
+                if producers_end is not None:
+                    # Partial wait for usage after producers, up to interruption.
+                    report.timing(usage_drain_real=now - producers_end)
             elif self.clock.origin_monotonic is None:
                 report.timing(preparation_real=now - report.data['timing']['started_monotonic'])
             if collector_thread and 'final_collection' not in report.data.get('phases', {}):

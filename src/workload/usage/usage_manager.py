@@ -13,6 +13,7 @@ from kubernetes.utils.quantity import parse_quantity
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
 from workload.usage.usage_assignment import UsageAssignmentEngine
+from workload.usage.usage_tracking import APPLIED, CANCELLED, EMPTY, FAILED, TARGET_ABSENT
 
 
 class UsageManager(multiprocessing.Process):
@@ -132,18 +133,33 @@ class UsageManager(multiprocessing.Process):
                 self.log("Stopping UsageManager")
                 self.emit(kind='stopped')
                 break
-            timing = event.get('replay_timing', {})
-            lag = max(0, monotonic() - timing.get('scheduled_monotonic', monotonic()))
-            context = dict(namespace=event.get('namespace'), resource=event.get('name'),
-                           trace_timestamp=timing.get('trace_timestamp'))
-            try:
-                self.handle_set_usage_event(event)
-            except Exception as error:
-                self.emit(kind='ack', completed=False, message=str(error), **context)
-            else:
-                self.emit(kind='ack', completed=True, lag_real=lag,
-                          lag_logical=lag * timing.get('speed_factor', 1), **context)
-            self.log(f'Usage reconciliation lag_real={lag}: {context}')
+            self.process_event(event, monotonic)
+
+    def process_event(self, event, monotonic):
+        """Emit one start and exactly one terminal outcome for an accepted event.
+
+        ``lag_real`` keeps its meaning: delay until the worker started the
+        event. Completion lag is derived from ``finished_monotonic``.
+        """
+        timing = event.get('replay_timing') or {}
+        started = monotonic()
+        lag = max(0, started - timing.get('scheduled_monotonic', started))
+        context = dict(event_id=event.get('event_id'), namespace=event.get('namespace'),
+                       resource=event.get('name'), trace_timestamp=timing.get('trace_timestamp'))
+        self.emit(kind='started', event_id=context['event_id'], started_monotonic=started)
+        def acknowledge(outcome, **fields):
+            self.emit(kind='ack', outcome=outcome, completed=outcome not in (FAILED, CANCELLED),
+                      started_monotonic=started, finished_monotonic=monotonic(), **fields, **context)
+        try:
+            outcome = self.handle_set_usage_event(event)
+        except Exception as error:
+            acknowledge(FAILED, message=str(error))
+        except BaseException:
+            acknowledge(CANCELLED, message='usage event cancelled')
+            raise
+        else:
+            acknowledge(outcome, lag_real=lag, lag_logical=lag * timing.get('speed_factor', 1))
+        self.log(f'Usage reconciliation lag_real={lag}: {context}')
 
     # --------------------------------------------------
     # Event handling
@@ -152,6 +168,7 @@ class UsageManager(multiprocessing.Process):
     def handle_set_usage_event(self, event):
         """
         Store the latest set-usage event for a workload and reconcile that workload.
+        Return the reconciliation outcome.
         """
 
         namespace = event["namespace"]
@@ -167,7 +184,7 @@ class UsageManager(multiprocessing.Process):
 
         self.last_usage_actions[workload_key] = usage_action
 
-        self.reconcile_workload(
+        return self.reconcile_workload(
             workload_key=workload_key
         )
 
@@ -215,6 +232,11 @@ class UsageManager(multiprocessing.Process):
         """
         Reconcile one workload by asking UsageAssignmentEngine for the final
         pod-level assignment and applying it to the cluster.
+
+        Return APPLIED only after every mutation succeeded, EMPTY when the
+        workload exists but has no emulated pod to receive usage, and
+        TARGET_ABSENT when the deployment is gone. Removing the usage of a
+        missing workload is cleanup, never an application. Errors raise.
         """
 
         namespace, name = workload_key
@@ -225,21 +247,19 @@ class UsageManager(multiprocessing.Process):
             emulated_pods_objects = self.list_emulated_pod_objects(namespace, name)
             
             if emulated_pods_objects is None:
-                self.log(f"[WARNING] Skipping reconciliation for {namespace}/{name}. Could not list emulated pods.")
-                return
-            
+                raise RuntimeError(f"Could not list emulated pods for {namespace}/{name}")
+
             emulated_pods = self.list_alive_pod_keys(emulated_pods_objects)
 
             if not emulated_pods: ## admissible check to avoid unecessary API calls.
                 deployment_status = self.deployment_exists(namespace, name)
 
                 if deployment_status is None:
-                    self.log(f"[WARNING] Skipping cleanup check for {namespace}/{name}. Could not check deployment existence.")
-                    return
+                    raise RuntimeError(f"Could not check deployment existence for {namespace}/{name}")
 
                 if deployment_status is False:
                     self.cleanup_workload(workload_key)
-                    return
+                    return TARGET_ABSENT
 
         emulated_pods_limit = self.get_pod_limits_map(emulated_pods_objects)
 
@@ -258,6 +278,7 @@ class UsageManager(multiprocessing.Process):
 
         self.apply_assignment(workload_key, assignment)
         self.last_emulated_pods[workload_key] = emulated_pods
+        return APPLIED if assignment else EMPTY
 
     # --------------------------------------------------
     # Apply assignment

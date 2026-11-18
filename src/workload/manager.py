@@ -16,6 +16,7 @@ import multiprocessing
 import queue
 import threading
 from workload.usage.usage_manager import UsageManager
+from workload.usage.usage_tracking import UsageTracker
 
 class WorkloadManager:
     TIME_OUT = 200
@@ -50,6 +51,8 @@ class WorkloadManager:
             enqueued=0, completed=0, failed=0, pending=0,
             stopped=False, errors=[], late_events=0, max_lag_real=0, total_lag_real=0,
             max_lag_logical=0, total_lag_logical=0, worst_event=None)
+        self.usage_tracker = UsageTracker()
+        self.usage_progress.update(self.usage_tracker.summary())
         self.usage_stop_sent = False
 
     def log(self, message):
@@ -185,13 +188,23 @@ class WorkloadManager:
 
     def _check_usage(self, stopping=False):
         progress = self.usage_progress
+        tracker = self.usage_tracker
         while True:
             try:
                 message = self.usage_status.get_nowait()
             except queue.Empty:
                 break
             kind = message['kind']
-            if kind == 'ack':
+            if kind == 'started':
+                problem = tracker.started(message)
+                if problem:
+                    progress['errors'].append(dict(message, kind='protocol', message=problem))
+            elif kind == 'ack':
+                # A duplicate or unknown identity is never counted twice.
+                problem = tracker.acknowledge(message)
+                if problem:
+                    progress['errors'].append(dict(message, kind='protocol', message=problem))
+                    continue
                 progress['completed' if message['completed'] else 'failed'] += 1
                 if not message['completed']:
                     progress['errors'].append(message)
@@ -211,7 +224,8 @@ class WorkloadManager:
                 self.usage_activity = getattr(self, 'usage_activity', 0) + 1
             else:
                 progress['errors'].append(message)
-            progress['pending'] = progress['enqueued'] - progress['completed'] - progress['failed']
+        progress['pending'] = len(tracker.pending)
+        progress.update(tracker.summary())
         if self.usage_manager.pid is not None and self.usage_manager.exitcode is not None:
             if self.usage_manager.exitcode != 0:
                 raise RuntimeError(f'UsageManager exited with code {self.usage_manager.exitcode}')
@@ -403,11 +417,14 @@ class WorkloadManager:
         return sum(1 for pod in pods.items if pod.metadata.namespace in namespaces)
     
     def set_workload_usage(self, usage_info):
+        """Deliver one event with a unique identity; only delivered events count."""
         with self.usage_lock:
             self.check_usage()
-            self.usage_queue.put(usage_info)
+            event = dict(usage_info, event_id=self.usage_tracker.next_event_id)
+            self.usage_queue.put(event)
+            self.usage_tracker.register(event)
             self.usage_progress['enqueued'] += 1
-            self.usage_progress['pending'] += 1
+            self.usage_progress['pending'] = len(self.usage_tracker.pending)
 
     def scale_workload(self, scale_info):
         name = scale_info['name']

@@ -261,7 +261,17 @@ original failure. A failed archive leaves its error beside the CSVs in
 `run.json`; a successful ZIP includes the finalized report.
 
 Timing separates preparation, replay and finalization, including an explicit
-15-logical-second observation tail after the usage queue drains. The effective
+15-logical-second observation tail after the usage queue drains. `replay_real`
+remains inclusive; within it, `producers_real` runs from the common origin until
+the infrastructure and workload replays have issued every action, and
+`usage_drain_real` is the subsequent wait for the remaining usage
+acknowledgements. After an interruption during that wait, `usage_drain_real`
+holds the elapsed part. Usage progress separates outcomes (`applied`, `empty`,
+`target_absent`, `failed`, `cancelled`), acknowledgement watermark, gaps, active
+and pending events, the oldest pending event and per-event execution time;
+`lag.usage.completion_lag` measures lateness until each replay event finished,
+while the existing usage lag fields keep measuring the delay until it started.
+See `docs/ACCELERATION.md` for their exact meaning. The effective
 factor divides scheduled logical duration by real replay duration and excludes
 the tail and preparation/finalization. Incomplete replays have no effective
 factor. Unstarted timing fields are null. These are operational diagnostics; the

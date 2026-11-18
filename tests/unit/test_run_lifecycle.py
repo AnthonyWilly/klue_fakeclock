@@ -19,6 +19,7 @@ from experiment_clock import ExperimentClock, ReplayDiagnostics
 from run_report import RunReport
 from workload.manager import WorkloadManager
 from workload.usage.usage_manager import UsageManager
+from workload.usage.usage_tracking import APPLIED, UsageTracker
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -178,8 +179,16 @@ def test_interrupt_runs_partial_cleanup(lifecycle):
     assert [error['message'] for error in report.data['errors']][:2] == ['interrupted', 'cleanup']
 
 
-def usage_parent(messages=(), exitcode=None):
+def usage_ack(event_id, outcome=APPLIED, **fields):
+    return dict(kind='ack', event_id=event_id, outcome=outcome,
+                completed=outcome in ('applied', 'empty', 'target_absent'), **fields)
+
+
+def usage_parent(messages=(), exitcode=None, events=2, monotonic=None):
     parent = WorkloadManager.__new__(WorkloadManager)
+    parent.usage_tracker = UsageTracker(monotonic)
+    for event_id in range(1, events + 1):
+        parent.usage_tracker.register(dict(namespace='ns', name='app', event_id=event_id))
     parent.usage_lock = threading.RLock()
     parent.usage_status = queue.Queue()
     for message in messages:
@@ -188,7 +197,7 @@ def usage_parent(messages=(), exitcode=None):
     parent.usage_stop_sent = False
     parent.usage_manager = Mock(pid=1, exitcode=exitcode)
     parent.usage_manager.is_alive.return_value = exitcode is None
-    parent.usage_progress = dict(enqueued=2, completed=0, failed=0, pending=2,
+    parent.usage_progress = dict(enqueued=events, completed=0, failed=0, pending=events,
         stopped=False, errors=[], late_events=0, max_lag_real=0, max_lag_logical=0,
         total_lag_real=0, total_lag_logical=0, worst_event=None)
     return parent
@@ -206,16 +215,19 @@ def test_worker_exitcode_and_missing_ack_are_failures():
 
 def test_worker_acknowledges_actual_reconciliation_and_fifo_stop():
     events, statuses = queue.Queue(), queue.Queue()
-    events.put(dict(namespace='ns', name='app', pods={}, replay_timing={
+    events.put(dict(namespace='ns', name='app', pods={}, event_id=1, replay_timing={
         'scheduled_monotonic': 10, 'speed_factor': 2, 'trace_timestamp': 20}))
     events.put('STOP')
     worker = UsageManager(events, status_queue=statuses)
-    worker.handle_set_usage_event = Mock()
+    worker.handle_set_usage_event = Mock(return_value=APPLIED)
     worker.process_events(monotonic=lambda: 12)
-    ack, stopped = statuses.get_nowait(), statuses.get_nowait()
+    started, ack, stopped = statuses.get_nowait(), statuses.get_nowait(), statuses.get_nowait()
+    assert started['kind'] == 'started' and started['event_id'] == 1
     assert ack['completed'] and ack['lag_real'] == 2 and ack['lag_logical'] == 4
+    assert ack['event_id'] == 1 and ack['outcome'] == APPLIED
     assert stopped == {'kind': 'stopped'}
-    parent = usage_parent([ack, dict(ack, completed=False, message='second event failed'), stopped], exitcode=0)
+    failed = usage_ack(2, 'failed', message='second event failed')
+    parent = usage_parent([started, ack, failed, stopped], exitcode=0)
     parent.finish_usage()
     assert parent.usage_progress['completed'] == 1
     assert parent.usage_progress['failed'] == 1
@@ -224,22 +236,23 @@ def test_worker_acknowledges_actual_reconciliation_and_fifo_stop():
 
 def test_usage_cru_error_is_failed_ack_and_does_not_drop_next_event():
     events, statuses = queue.Queue(), queue.Queue()
-    events.put(dict(namespace='ns', name='bad'))
-    events.put(dict(namespace='ns', name='good'))
+    events.put(dict(namespace='ns', name='bad', event_id=1))
+    events.put(dict(namespace='ns', name='good', event_id=2))
     events.put('STOP')
     worker = UsageManager(events, status_queue=statuses)
     worker.k8s_api = Mock()
     worker.k8s_api.create_infrastructure_object.side_effect = ApiException(status=403)
-    worker.handle_set_usage_event = Mock(side_effect=[RuntimeError('CRU failed'), None])
+    worker.handle_set_usage_event = Mock(side_effect=[RuntimeError('CRU failed'), APPLIED])
     with pytest.raises(RuntimeError, match='CRU example'):
         worker.apply_cru('example', {})
     activity = statuses.get_nowait()
     assert activity['kind'] == 'activity'
     assert activity['stats']['failures'] == 1
     worker.process_events(monotonic=lambda: 12)
-    assert statuses.get_nowait()['completed'] is False
-    assert statuses.get_nowait()['completed'] is True
-    assert statuses.get_nowait()['kind'] == 'stopped'
+    acks = [message for message in iter(statuses.get_nowait, {'kind': 'stopped'})
+            if message['kind'] == 'ack']
+    assert [(ack['event_id'], ack['completed'], ack['outcome']) for ack in acks] == [
+        (1, False, 'failed'), (2, True, APPLIED)]
 
 
 def test_worker_fatal_initialization_is_sent_to_parent(monkeypatch):
@@ -626,3 +639,64 @@ def test_origin_waits_for_operational_usage_and_metrics_confirmations(lifecycle)
     result.run()
     assert confirmations == ['pods', 'metrics', 'usage']
     assert result.clock.origin_monotonic is not None
+
+
+def final_drain(result, now, seconds, error=None):
+    def drain(**kwargs):
+        if result.clock.origin_monotonic is None:
+            return
+        now[0] += seconds
+        if error is not None:
+            raise error
+    result.workload_manager.drain_usage.side_effect = drain
+
+
+def test_producers_and_final_usage_wait_are_measured_separately(lifecycle):
+    result, report, now = lifecycle
+    final_drain(result, now, 3)
+    tracker = UsageTracker(lambda: now[0])
+    result.workload_manager.usage_progress.update(tracker.summary())
+    result.run()
+    timing = json.loads(report.path.read_text())['timing']
+    assert timing['producers_real'] == 10
+    assert timing['usage_drain_real'] == 3
+    # replay_real stays inclusive of the final usage wait.
+    assert timing['replay_real'] == 13
+    data = json.loads(report.path.read_text())
+    assert data['lag']['usage']['completion_lag']['max_real'] == 0
+    assert data['progress']['usage']['outcomes']['applied'] == 0
+    assert data['progress']['usage']['acknowledgements']['pending'] == 0
+
+
+def test_interruption_during_final_usage_wait_keeps_partial_measurements(lifecycle):
+    result, report, now = lifecycle
+    final_drain(result, now, 2, KeyboardInterrupt('stop requested'))
+    with pytest.raises(RuntimeError, match='interrupted'):
+        result.run()
+    data = json.loads(report.path.read_text())
+    assert data['status'] == 'interrupted'
+    assert data['timing']['producers_real'] == 10
+    assert data['timing']['usage_drain_real'] == 2
+    assert data['timing']['replay_real'] == 12
+    assert not data['timing']['replay_complete']
+    result.workload_manager.tear_down.assert_called_once()
+
+
+def test_absent_usage_targets_are_reported_without_counting_as_applied(lifecycle):
+    result, report, now = lifecycle
+    result.workload_manager.usage_progress.update(outcomes=dict(
+        applied=2, empty=0, target_absent=1, failed=0, cancelled=0))
+    result.run()
+    assert report.data['status'] == 'completed_with_warnings'
+    assert any('no target workload' in warning['message'] for warning in report.data['warnings'])
+    assert report.data['progress']['usage']['outcomes']['target_absent'] == 1
+
+
+def test_protocol_error_fails_the_run(lifecycle):
+    result, report, now = lifecycle
+    result.workload_manager.usage_progress['errors'].append(dict(
+        kind='protocol', message='usage acknowledgement protocol error (duplicate): event 1', event_id=1))
+    with pytest.raises(RuntimeError, match='failed'):
+        result.run()
+    assert any('protocol error' in error['message'] and error['event_id'] == 1
+               for error in report.data['errors'])
