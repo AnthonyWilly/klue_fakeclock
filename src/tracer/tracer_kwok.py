@@ -271,11 +271,19 @@ class TracerKWOKOnly:
             how="left",
             suffixes=("_resource", "_karpenter_state")
         ).assign(
-            node=lambda df: df["node_karpenter_state"]
+            node=lambda df: df["node_karpenter_state"].fillna(df["node_resource"])
         ).drop(
             columns=["node_resource", "node_karpenter_state"]
         )
 
+        # Requests can identify a scheduled pod even when its CPU series is
+        # missing. Infer its node type only when that node has one known type.
+        node_types = self.karpenter_pods_state[['node', 'instance_type']].dropna().drop_duplicates()
+        node_types = node_types[~node_types['node'].eq('unallocated') &
+                                ~node_types['instance_type'].eq('unallocated')]
+        node_types = node_types[~node_types['node'].duplicated(keep=False)].set_index('node')['instance_type']
+        df_merged['instance_type'] = df_merged['instance_type'].fillna(
+            df_merged['node'].map(node_types).astype('string'))
         df_merged["node"] = df_merged["node"].fillna("unallocated")
         df_merged["instance_type"] = df_merged["instance_type"].fillna("unallocated")
         df_merged["phase"] = df_merged["phase"].fillna("Pending")
@@ -522,18 +530,13 @@ class TracerKWOKOnly:
         2. A detailed summary of pod allocations grouped by namespace, node, replicaset,
            owner kind, and instance type.
 
-        Additionally, removes nodes that appear in only one timestamp.
+        Nodes observed once still require an initial placement when present at setup.
         """
         self.log("[INFO] Processing and saving pods allocation.")
         df_pods_allocation = self.df_final[self.df_final['timestamp'] == self.df_final['timestamp'].min()]
 
         df_pods_allocation = df_pods_allocation[~df_pods_allocation["node"].isin(["unallocated"]) & ~df_pods_allocation["instance_type"].isin(["unallocated"])]
 
-        # Remove nodes that appear in only one timestamp in the whole trace
-        node_timestamp_counts = self.df_final.groupby('node')['timestamp'].nunique()
-        valid_nodes = node_timestamp_counts[node_timestamp_counts > 1].index
-        df_pods_allocation = df_pods_allocation[df_pods_allocation['node'].isin(valid_nodes)]
-        
         self.df_pods_allocation = df_pods_allocation.groupby(['namespace', 'node', 'replicaset', 'owner_kind', 'instance_type']).agg(
             pods_count=('replicaset', 'count'),
         ).reset_index()
@@ -565,7 +568,8 @@ class TracerKWOKOnly:
         df_adjusted.loc[first_occurrences, 'action'] = 'create'
 
         last_occurrences = df_adjusted.groupby(['replicaset','namespace']).tail(1).index
-        df_adjusted.loc[last_occurrences, 'action'] = 'delete'
+        single_occurrences = first_occurrences.intersection(last_occurrences)
+        df_adjusted.loc[last_occurrences.difference(single_occurrences), 'action'] = 'delete'
 
         df_adjusted['pods_changed'] = (
             df_adjusted.groupby(['namespace', 'replicaset'])['pods']
@@ -574,6 +578,17 @@ class TracerKWOKOnly:
         )
 
         self.df_final = df_adjusted[df_adjusted['pods_changed'] | (df_adjusted['action'].isin(['create', 'delete']))].drop(columns=['pods_changed'])
+
+        # A single observation still represents a live workload for one sample.
+        # Keep its create (including at setup); delete at the next sample when
+        # that sample is inside the trace, otherwise leave removal to teardown.
+        deletions = df_adjusted.loc[single_occurrences].drop(columns=['pods_changed']).copy()
+        deletions['timestamp'] += self.step
+        deletions = deletions[deletions['timestamp'] <= df_adjusted['timestamp'].max()]
+        deletions['action'] = 'delete'
+        if self.step > 0 and not deletions.empty:
+            self.df_final = pd.concat([self.df_final, deletions], ignore_index=True).sort_values(
+                ['timestamp', 'namespace', 'replicaset'])
 
     def merge_applied_objects(self, *objects_maps):
         merged = {}
@@ -713,9 +728,8 @@ class TracerKWOKOnly:
         4. For each ('node', 'instance_type') pair, marks the first timestamped
            occurrence as a 'create' action and the last as a 'delete' action.
         5. Filters to keep only these 'create' and 'delete' action rows.
-        6. Further filters to retain only ('node', 'instance_type') pairs that
-           have more than one action (i.e., both a create and a delete, implying
-           the node existed for some duration).
+        6. For nodes observed once, preserves create and adds delete one sample
+           later if it is within the trace window; otherwise teardown removes them.
         7. Removes entries where 'node' or 'instance_type' is "unallocated".
         8. The final DataFrame, sorted by timestamp, action, instance_type,
            and node, is stored in `self.df_infrastructure`.
@@ -736,15 +750,18 @@ class TracerKWOKOnly:
 
         infra['action'] = ''
         infra.loc[first_idx, 'action'] = 'create'
-        infra.loc[last_idx, 'action'] = 'delete'
+        single_idx = first_idx.intersection(last_idx)
+        infra.loc[last_idx.difference(single_idx), 'action'] = 'delete'
+
+        deletions = infra.loc[single_idx].copy()
+        deletions['timestamp'] += self.step
+        deletions = deletions[deletions['timestamp'] <= self.df_final['timestamp'].max()]
+        deletions['action'] = 'delete'
+        if self.step > 0 and not deletions.empty:
+            infra = pd.concat([infra, deletions], ignore_index=True)
 
         # Manter apenas os eventos 'create' e 'delete'
         infra = infra[infra['action'].isin(['create', 'delete'])]
-
-        # Remover nodes com valores faltantes ou que só aparecem uma vez
-        counts = infra.groupby(['node', 'instance_type'])['action'].count()
-        valid_nodes = counts[counts > 1].index
-        infra = infra.set_index(['node', 'instance_type']).loc[valid_nodes].reset_index()
 
         infra = infra[(infra['node'] != 'unallocated') & (infra['instance_type'] != 'unallocated')]
 

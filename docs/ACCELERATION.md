@@ -8,6 +8,15 @@ with the requested factor and produce lag diagnostics. Preparation, readiness,
 HTTP and cleanup timeouts use real seconds. Total execution time is not expected
 to improve proportionally to F.
 
+The KWOK tracer creates workloads observed in a single sample, including during
+initial setup. It schedules their deletion one logical sample later when that
+sample is within the trace window; otherwise teardown removes them. Such
+workloads remain part of the initial placement coverage check. Nodes observed in
+one sample follow the same lifecycle and remain in the initial allocation.
+When a pod's CPU metadata is absent, the tracer preserves its node from resource
+metrics and recovers the instance type only from an unambiguous type for that
+node in the trace. It does not invent a destination or choose a conflicting type.
+
 The usage worker processes every event in FIFO order. Within one event, up to
 four independent pod usage writes run concurrently; all must finish before the
 event is acknowledged. Periodic reconciliation groups a single pod snapshot
