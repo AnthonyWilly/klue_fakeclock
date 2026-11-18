@@ -274,6 +274,8 @@ def test_usage_process_uses_serialized_interval(monkeypatch):
     queue = Mock()
     queue.get.return_value = 'STOP'
     monkeypatch.setattr(usage_module, 'K8SAPI', Mock())
+    from test_usage_resource_cache import make_cache
+    monkeypatch.setattr(usage_module, 'ResourceCache', lambda *a, **k: make_cache(start=False))
     usage = UsageManager(queue, reconcile_interval_seconds=2.5)
     monkeypatch.setattr(usage_module.time, 'monotonic', lambda: 100)
     usage.run()

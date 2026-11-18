@@ -4,7 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from kubernetes.client.rest import ApiException
+
 from test_run_lifecycle import lifecycle, usage_ack, usage_parent
+from test_usage_resource_cache import caches, deployment, pod as cached_pod
 from workload.usage.usage_manager import UsageManager
 
 
@@ -14,36 +17,33 @@ def pod(name, workload):
               spec=NS(containers=[]))
 
 
-def test_periodic_scan_uses_one_snapshot_for_1000_workloads():
-    worker = UsageManager(queue.Queue())
-    worker.k8s_api = Mock()
-    pods = [pod(f'p{i}', f'app{i}') for i in range(1000)]
-    worker.k8s_api.v1.list_pod_for_all_namespaces.return_value = NS(items=pods)
+def test_periodic_tick_examines_only_changed_workloads_without_requests(caches):
+    from test_usage_resource_cache import deployment, pod as cached_pod, usage_worker
+    cache = caches(pods=[cached_pod(f'p{i}', f'app{i}') for i in range(1000)],
+                   deployments=[deployment(f'app{i}') for i in range(1000)])
+    worker = usage_worker(cache)
     worker.last_usage_actions = {('ns', f'app{i}'): {} for i in range(1000)}
-    worker.last_emulated_pods = {('ns', f'app{i}'): {('ns', f'p{i}')} for i in range(1000)}
-    worker.reconcile_workload = Mock()
     worker.reconcile_tracked_workloads()
-    worker.k8s_api.v1.list_pod_for_all_namespaces.assert_called_once_with(
-        label_selector='deployment', _request_timeout=200)
-    worker.k8s_api.v1.list_namespaced_pod.assert_not_called()
-    worker.k8s_api.apps_v1.list_deployment_for_all_namespaces.assert_not_called()
-    worker.reconcile_workload.assert_not_called()
-    assert worker.api_stats['list-pods']['calls'] == 1
+    assert worker.apply_assignment.call_count == 1000
+    worker.reconcile_tracked_workloads()
+    assert worker.apply_assignment.call_count == 1000
+    assert len(cache.fakes.pods.calls) == len(cache.fakes.deployments.calls) == 1
+    worker.k8s_api.v1.list_pod_for_all_namespaces.assert_not_called()
+    worker.k8s_api.read_namespaced_deployment.assert_not_called()
 
 
-def test_periodic_snapshot_handles_new_pods_and_deleted_workloads():
-    worker = UsageManager(queue.Queue())
-    worker.k8s_api = Mock()
+def test_periodic_reconciliation_handles_new_pods_and_deleted_workloads(caches):
+    from test_usage_resource_cache import deployment, pod as cached_pod, usage_worker
+    cache = caches(pods=[cached_pod('new-pod', 'new')],
+                   deployments=[deployment('new'), deployment('scaled-zero')])
+    worker = usage_worker(cache)
     worker.last_usage_actions = {('ns', name): {} for name in ('new', 'gone', 'scaled-zero')}
-    added = pod('new-pod', 'new')
-    worker.k8s_api.v1.list_pod_for_all_namespaces.return_value = NS(items=[added])
-    worker.k8s_api.apps_v1.list_deployment_for_all_namespaces.return_value = NS(items=[
-        NS(metadata=NS(namespace='ns', name=n)) for n in ('new', 'scaled-zero')])
-    worker.reconcile_workload = Mock()
+    worker.k8s_api.read_namespaced_deployment.side_effect = ApiException(status=404)
+    cache.dirty.add(('ns', 'gone'))
     worker.cleanup_workload = Mock()
     worker.reconcile_tracked_workloads()
     worker.cleanup_workload.assert_called_once_with(('ns', 'gone'))
-    assert [c.args[0] for c in worker.reconcile_workload.call_args_list] == [
+    assert [c.args[0] for c in worker.apply_assignment.call_args_list] == [
         ('ns', 'new'), ('ns', 'scaled-zero')]
 
 
@@ -225,31 +225,32 @@ def test_setup_event_has_no_logical_completion_lag_but_counts_execution():
     assert summary['acknowledgements']['max_oldest_pending_age_real'] == 4
 
 
-def worker_with_pods(pods, deployment_exists=True):
+def worker_with_pods(caches, pods, deployment_exists=True):
     worker = UsageManager(queue.Queue())
     worker.k8s_api = Mock()
-    worker.k8s_api.v1.list_namespaced_pod.return_value = NS(items=pods)
-    worker.deployment_exists = Mock(return_value=deployment_exists)
+    worker.resource_cache = caches(pods=pods,
+                                   deployments=[deployment('app')] if deployment_exists else [])
+    worker.k8s_api.read_namespaced_deployment.side_effect = ApiException(status=404)
     worker.assignment_engine = Mock()
     worker.cleanup_workload = Mock()
     return worker
 
 
-def test_reconciliation_outcomes_distinguish_applied_empty_and_absent_target():
+def test_reconciliation_outcomes_distinguish_applied_empty_and_absent_target(caches):
     from workload.usage.usage_tracking import APPLIED, EMPTY, TARGET_ABSENT
     event = dict(namespace='ns', name='app', pods={'real': dict(cpu=.1, memory=10)})
-    worker = worker_with_pods([pod('p', 'app')])
+    worker = worker_with_pods(caches, [cached_pod('p', 'app')])
     worker.assignment_engine.resolve.return_value = {('ns', 'p'): dict(cpu=.1, memory=10)}
     worker.apply_assignment = Mock()
     assert worker.handle_set_usage_event(event) == APPLIED
 
-    worker = worker_with_pods([])
+    worker = worker_with_pods(caches, [])
     worker.assignment_engine.resolve.return_value = {}
     worker.apply_assignment = Mock()
     assert worker.handle_set_usage_event(event) == EMPTY
     worker.apply_assignment.assert_called_once_with(('ns', 'app'), {})
 
-    worker = worker_with_pods([], deployment_exists=False)
+    worker = worker_with_pods(caches, [], deployment_exists=False)
     worker.apply_assignment = Mock()
     # Cleanup of a missing target is not an application of its usage.
     assert worker.handle_set_usage_event(event) == TARGET_ABSENT
@@ -257,11 +258,11 @@ def test_reconciliation_outcomes_distinguish_applied_empty_and_absent_target():
     worker.apply_assignment.assert_not_called()
 
 
-def test_partial_pod_failure_is_a_failed_terminal_outcome():
+def test_partial_pod_failure_is_a_failed_terminal_outcome(caches):
     from concurrent.futures import ThreadPoolExecutor
     from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
     from workload.usage.usage_tracking import UsageTracker
-    worker = worker_with_pods([pod('p0', 'app'), pod('p1', 'app')])
+    worker = worker_with_pods(caches, [cached_pod('p0', 'app'), cached_pod('p1', 'app')])
     worker.cru_generator = ClusterResourceUsageGenerator()
     worker.assignment_engine.resolve.return_value = {
         ('ns', 'p0'): dict(cpu=.1, memory=10), ('ns', 'p1'): dict(cpu=.1, memory=10)}

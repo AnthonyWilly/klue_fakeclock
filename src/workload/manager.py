@@ -219,6 +219,9 @@ class WorkloadManager:
                         progress['worst_event'] = message
             elif kind == 'stopped':
                 progress['stopped'] = True
+            elif kind == 'cache':
+                # Observation counters only; they do not prove usage progress.
+                progress['resource_cache'] = message['stats']
             elif kind == 'activity':
                 progress.setdefault('api', {})[message['action']] = message['stats']
                 self.usage_activity = getattr(self, 'usage_activity', 0) + 1

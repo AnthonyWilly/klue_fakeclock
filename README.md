@@ -166,6 +166,15 @@ KWOK uses 15/7.5/3 real seconds and queries use 30/15/6 real seconds.
 Reconciliation runs on monotonic deadlines even while usage events arrive
 continuously. Every event is processed in queue order.
 
+The usage worker reads emulated pods and deployments from an in-memory
+list/watch cache that is ready before it accepts events. Reconciliation ticks
+reapply only workloads whose live pods, pod UIDs, limits or deployment identity
+changed, without per-event or per-tick listing. An expired watch is relisted; a
+cache that stays unhealthy for 30 real seconds fails the affected reconciliation
+instead of serving stale state. A deployment missing from the cache is reported
+absent only after one direct read confirms it, until it is observed again. Cache
+counters are reported under `progress.usage.resource_cache` in `run.json`.
+
 Before replay, KLUE overlays the main kube-state-metrics endpoint, reconciles
 node ServiceMonitors, checks the loaded Prometheus targets and intervals, and
 waits for fresh CPU, memory, requests, limits and owner metrics. The readiness

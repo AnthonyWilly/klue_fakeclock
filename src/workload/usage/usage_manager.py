@@ -2,16 +2,14 @@ import multiprocessing
 import queue
 import time
 import math
-from collections import defaultdict
-from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import threading
 
 from kubernetes.client.rest import ApiException
-from kubernetes.utils.quantity import parse_quantity
 from util.k8s_api.k8s_api import K8SAPI
 from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsageGenerator
+from workload.usage.resource_cache import ResourceCache, is_live_pod, pod_limits
 from workload.usage.usage_assignment import UsageAssignmentEngine
 from workload.usage.usage_tracking import APPLIED, CANCELLED, EMPTY, FAILED, TARGET_ABSENT
 
@@ -22,10 +20,10 @@ class UsageManager(multiprocessing.Process):
 
     - Receives set-usage events with real pod-level usage snapshots.
     - Tracks workloads by (namespace, name).
-    - Periodically checks the exact set of emulated pods for each tracked workload.
+    - Observes emulated pods and deployments through a LIST/WATCH cache.
     - Reconciles when:
         1. a new set-usage event arrives; or
-        2. the emulated pod set changes.
+        2. the cache reports a relevant change of a tracked workload.
     - Delegates usage distribution to UsageAssignmentEngine.
     - Applies the returned assignment as one ClusterResourceUsage per emulated pod.
     """
@@ -33,6 +31,11 @@ class UsageManager(multiprocessing.Process):
     TIME_OUT = 200
     API_CONCURRENCY = 4
     RECONCILE_INTERVAL_SECONDS = 5
+    CACHE_READY_TIMEOUT = 120
+    CACHE_HEALTH_TIMEOUT = 30
+    CACHE_STOP_TIMEOUT = 5
+    # Real time a deployment confirmed by the API may take to reach the cache.
+    CACHE_CATCH_UP_TIMEOUT = 10
 
     CRU_GROUP = "kwok.x-k8s.io"
     CRU_VERSION = "v1alpha1"
@@ -57,8 +60,16 @@ class UsageManager(multiprocessing.Process):
         # (namespace, workload_name) -> set(cru_name)
         self.managed_crus_by_workload = {}
 
+        # (namespace, workload_name) -> cache signature committed with the
+        # last successful assignment.
+        self.last_signatures = {}
+
+        # Workloads whose reconciliation failed and must be examined again.
+        self.retry_workloads = set()
+
         # set(cru_name)
         self.existing_crus = set()
+        self.resource_cache = None
         self.api_stats = {}
         self.api_lock = None
         self.usage_executor = None
@@ -79,11 +90,21 @@ class UsageManager(multiprocessing.Process):
             self.assignment_engine = UsageAssignmentEngine()
             self.cru_generator = ClusterResourceUsageGenerator()
             self.api_lock = threading.Lock()
-            # Only independent pods of the SAME event run concurrently. Wait
-            # for every result before acknowledging or consuming the next event.
-            with ThreadPoolExecutor(max_workers=self.API_CONCURRENCY) as executor:
-                self.usage_executor = executor
-                self.process_events()
+            self.resource_cache = ResourceCache(
+                self.k8s_api.v1.list_pod_for_all_namespaces,
+                self.k8s_api.apps_v1.list_deployment_for_all_namespaces,
+                call=self.api_call, on_update=self.emit_cache)
+            try:
+                # Events wait in the queue until the cache can answer them.
+                self.resource_cache.start().wait_ready(self.CACHE_READY_TIMEOUT)
+                # Only independent pods of the SAME event run concurrently. Wait
+                # for every result before acknowledging or consuming the next event.
+                with ThreadPoolExecutor(max_workers=self.API_CONCURRENCY) as executor:
+                    self.usage_executor = executor
+                    self.process_events()
+            finally:
+                if not self.resource_cache.stop(self.CACHE_STOP_TIMEOUT):
+                    self.log("[WARN] resource cache threads did not stop in time")
         except BaseException as error:
             self.emit(kind='fatal', message=str(error))
             raise
@@ -111,6 +132,10 @@ class UsageManager(multiprocessing.Process):
         if self.status_queue is not None:
             self.status_queue.put(message)
 
+    def emit_cache(self, stats=None):
+        if self.resource_cache is not None:
+            self.emit(kind='cache', stats=stats or self.resource_cache.stats())
+
     def process_events(self, monotonic=None):
         """A busy queue cannot starve reconciliation; events retain FIFO order."""
         monotonic = monotonic or time.monotonic
@@ -131,6 +156,7 @@ class UsageManager(multiprocessing.Process):
                 continue
             if event == "STOP":
                 self.log("Stopping UsageManager")
+                self.emit_cache()
                 self.emit(kind='stopped')
                 break
             self.process_event(event, monotonic)
@@ -184,9 +210,12 @@ class UsageManager(multiprocessing.Process):
 
         self.last_usage_actions[workload_key] = usage_action
 
-        return self.reconcile_workload(
-            workload_key=workload_key
-        )
+        try:
+            return self.reconcile_workload(workload_key=workload_key)
+        except Exception:
+            # Periodic reconciliation retries a workload whose event failed.
+            self.retry_workloads.add(workload_key)
+            raise
 
     # --------------------------------------------------
     # Reconciliation
@@ -194,41 +223,58 @@ class UsageManager(multiprocessing.Process):
 
     def reconcile_tracked_workloads(self):
         """
-        Periodically check whether the exact emulated pod set changed.
+        Reapply tracked workloads whose observed topology changed.
+
+        Only workloads marked by the cache, or whose previous reconciliation
+        failed, are examined; no request is issued for unchanged workloads.
         """
 
-        if not self.last_usage_actions:
+        if self.resource_cache is None:
             return
-        # One coherent snapshot replaces one API request per tracked workload.
-        snapshot = self.api_call('list-pods', self.k8s_api.v1.list_pod_for_all_namespaces,
-                                 label_selector='deployment')
-        grouped = defaultdict(list)
-        for pod in snapshot.items:
-            labels = pod.metadata.labels or {}
-            grouped[(pod.metadata.namespace, labels.get('deployment'))].append(pod)
-        empty = [key for key in self.last_usage_actions
-                 if not self.list_alive_pod_keys(SimpleNamespace(items=grouped[key]))]
-        deployments = None
-        if empty:
-            listed = self.api_call('list-deployments',
-                self.k8s_api.apps_v1.list_deployment_for_all_namespaces)
-            deployments = {(obj.metadata.namespace, obj.metadata.name) for obj in listed.items}
-        for workload_key in list(self.last_usage_actions):
-            pods = SimpleNamespace(items=grouped[workload_key])
-            keys = self.list_alive_pod_keys(pods)
+        self.emit_cache()
+        changed = self.resource_cache.take_dirty() | self.retry_workloads
+        self.retry_workloads = set()
+        for workload_key in [key for key in self.last_usage_actions if key in changed]:
             # A failure for one workload must not starve later workloads.
             try:
-                if not keys and workload_key not in deployments:
+                view = self.observe_workload(workload_key)
+                if view is None:
                     self.cleanup_workload(workload_key)
                     continue
-                if self.last_emulated_pods.get(workload_key) == keys:
+                if self.last_signatures.get(workload_key) == view.signature:
                     continue
-                self.reconcile_workload(workload_key, keys, pods)
+                self.reconcile_workload(workload_key, view.keys, view.pods, view.signature)
             except Exception as error:
+                self.retry_workloads.add(workload_key)
                 self.emit(kind='error', message=str(error), action='periodic-reconciliation',
                           namespace=workload_key[0], resource=workload_key[1])
 
-    def reconcile_workload(self, workload_key, emulated_pods=None, emulated_pods_objects=None):
+    def observe_workload(self, workload_key):
+        """Cached view of a workload, or None when its deployment is gone.
+
+        Absence is decided by the cache only after one authoritative read
+        confirmed it; later observations of that deployment invalidate the
+        confirmation. A deployment that exists but has not reached the cache
+        yet is awaited for a bounded time instead of being reported absent.
+        """
+
+        cache = self.resource_cache
+        view = cache.snapshot(workload_key, self.CACHE_HEALTH_TIMEOUT)
+        if view.keys or view.deployment_uid is not None:
+            return view
+        if view.absence_confirmed:
+            return None
+        namespace, name = workload_key
+        if not self.deployment_exists(namespace, name):
+            cache.confirm_absent(view)
+            return None
+        if not cache.wait_for(lambda read: read(workload_key).deployment_uid is not None,
+                              self.CACHE_CATCH_UP_TIMEOUT):
+            raise RuntimeError(f"Resource cache did not observe deployment {namespace}/{name}")
+        return cache.snapshot(workload_key, self.CACHE_HEALTH_TIMEOUT)
+
+    def reconcile_workload(self, workload_key, emulated_pods=None, emulated_pods_objects=None,
+                           signature=None):
         """
         Reconcile one workload by asking UsageAssignmentEngine for the final
         pod-level assignment and applying it to the cluster.
@@ -244,22 +290,11 @@ class UsageManager(multiprocessing.Process):
         last_usage_action = self.last_usage_actions.get(workload_key)
 
         if emulated_pods is None:
-            emulated_pods_objects = self.list_emulated_pod_objects(namespace, name)
-            
-            if emulated_pods_objects is None:
-                raise RuntimeError(f"Could not list emulated pods for {namespace}/{name}")
-
-            emulated_pods = self.list_alive_pod_keys(emulated_pods_objects)
-
-            if not emulated_pods: ## admissible check to avoid unecessary API calls.
-                deployment_status = self.deployment_exists(namespace, name)
-
-                if deployment_status is None:
-                    raise RuntimeError(f"Could not check deployment existence for {namespace}/{name}")
-
-                if deployment_status is False:
-                    self.cleanup_workload(workload_key)
-                    return TARGET_ABSENT
+            view = self.observe_workload(workload_key)
+            if view is None:
+                self.cleanup_workload(workload_key)
+                return TARGET_ABSENT
+            emulated_pods, emulated_pods_objects, signature = view.keys, view.pods, view.signature
 
         emulated_pods_limit = self.get_pod_limits_map(emulated_pods_objects)
 
@@ -277,7 +312,10 @@ class UsageManager(multiprocessing.Process):
         )
 
         self.apply_assignment(workload_key, assignment)
+        # Commit the observed topology only after every mutation succeeded.
         self.last_emulated_pods[workload_key] = emulated_pods
+        if signature is not None:
+            self.last_signatures[workload_key] = signature
         return APPLIED if assignment else EMPTY
 
     # --------------------------------------------------
@@ -388,17 +426,8 @@ class UsageManager(multiprocessing.Process):
                 raise
 
 
-    def list_emulated_pod_objects(self, namespace, workload_name):
-        """
-        Return the exact set of live emulated pods for a workload.
-        """
-
-        return self.api_call('list-workload-pods', self.k8s_api.v1.list_namespaced_pod,
-            namespace=namespace,
-            label_selector=f"deployment={workload_name}",
-        )
-
     def deployment_exists(self, namespace, name):
+        """Authoritative read used only to confirm a deployment absent from the cache."""
         try:
             self.api_call('read-deployment', self.k8s_api.read_namespaced_deployment,
                 namespace=namespace,
@@ -417,68 +446,18 @@ class UsageManager(multiprocessing.Process):
     # --------------------------------------------------
 
     def is_live_pod(self, pod):
-        if pod.metadata.deletion_timestamp is not None:
-            return False
+        return is_live_pod(pod)
 
-        if pod.status.phase in {"Succeeded", "Failed"}:
-            return False
-
-        return True
-    
     def list_alive_pod_keys(self, pods):
-        result = set()
-        for pod in pods.items:
-            if self.is_live_pod(pod):
-                pod_name = pod.metadata.name
-                pod_namespace = pod.metadata.namespace
-
-                result.add((pod_namespace, pod_name))
-        
-        return result
+        return {(pod.metadata.namespace, pod.metadata.name) for pod in pods.items if is_live_pod(pod)}
 
     def get_pod_limits_map(self, pods):
         """
         Return current resource limits for the pods of a workload.
         """
 
-        result = {}
-
-        for pod in pods.items:
-            if not self.is_live_pod(pod):
-                continue
-
-            namespace = pod.metadata.namespace
-            pod_name = pod.metadata.name
-
-            cpu_total = None
-            memory_total = None
-
-            for container in pod.spec.containers:
-                resources = container.resources
-                limits = resources.limits if resources and resources.limits else {}
-
-                cpu_limit_base = limits.get("cpu")
-                memory_limit_base = limits.get("memory")
-
-                if cpu_limit_base is not None:
-                    cpu_limit = parse_quantity(str(cpu_limit_base))
-                    cpu_total = (cpu_total or 0) + cpu_limit
-
-                if memory_limit_base is not None:
-                    memory_limit = parse_quantity(str(memory_limit_base))
-                    memory_total = (memory_total or 0) + memory_limit
-
-            pod_limits = {}
-
-            if cpu_total is not None:
-                pod_limits["cpu"] = float(cpu_total)
-
-            if memory_total is not None:
-                pod_limits["memory"] = int(memory_total)
-
-            result[(namespace, pod_name)] = pod_limits
-
-        return result
+        return {(pod.metadata.namespace, pod.metadata.name): pod_limits(pod)
+                for pod in pods.items if is_live_pod(pod)}
 
     # --------------------------------------------------
     # Clean-up
@@ -506,5 +485,7 @@ class UsageManager(multiprocessing.Process):
 
         self.last_usage_actions.pop(workload_key, None)
         self.last_emulated_pods.pop(workload_key, None)
+        self.last_signatures.pop(workload_key, None)
+        self.retry_workloads.discard(workload_key)
         self.managed_crus_by_workload.pop(workload_key, None)
         self.assignment_engine.cleanup_workload(workload_key)
