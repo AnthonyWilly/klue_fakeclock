@@ -18,17 +18,20 @@ class KubernetesObjectApplier:
     def apply_deployment(self, obj, namespace, name):
         """
         Aplica um objeto do tipo Deployment ao cluster.
+
+        Retorna a resposta da API, com UID e geração da mutação confirmada.
         """
         try:
             self.k8s_api.read_namespaced_deployment(name, namespace)
-            self.k8s_api.patch_namespaced_deployment(name, namespace, obj)
+            response = self.k8s_api.patch_namespaced_deployment(name, namespace, obj)
             self.log(f"[INFO] Deployment {name} updated in namespace {namespace}.")
         except client.exceptions.ApiException as e:
             if e.status == 404:
-                self.k8s_api.create_namespaced_deployment(namespace, obj)
+                response = self.k8s_api.create_namespaced_deployment(namespace, obj)
                 self.log(f"[INFO] Deployment {name} created in namespace {namespace}.")
             else:
                 raise
+        return response
 
     def apply_hpa(self, obj, namespace, name):
         """
@@ -105,13 +108,15 @@ class KubernetesObjectApplier:
     def apply_object(self, obj):
         """
         Aplica um objeto Kubernetes ao cluster, delegando para a função apropriada.
+
+        Retorna a resposta da API quando o tipo a fornece (Deployment).
         """
         kind = obj.get("kind", "").lower()
         namespace = obj["metadata"].get("namespace", "default")
         name = obj["metadata"]["name"]
 
         if kind == "deployment":
-            self.apply_deployment(obj, namespace, name)
+            return self.apply_deployment(obj, namespace, name)
         elif kind == "horizontalpodautoscaler" and self.hpa:
             self.apply_hpa(obj, namespace, name)
         elif kind == "nodeclaim":

@@ -1,6 +1,7 @@
 import copy
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -187,11 +188,12 @@ def test_applier_propagates_non_404_failure(kind):
         applier.apply_object({'kind': kind, 'metadata': {'name': 'x'}})
 
 
-def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch, tmp_path):
+@pytest.mark.parametrize('factor, hpa', [(2, False), (1, True)])
+def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch, tmp_path, factor, hpa):
     import manager as coordinator
     from experiment_clock import ExperimentClock
     time = FakeTime()
-    clock = ExperimentClock(2, time.monotonic, time.wait, lambda: 1700000000)
+    clock = ExperimentClock(factor, time.monotonic, time.wait, lambda: 1700000000)
     monkeypatch.setattr(coordinator, 'ExperimentClock', lambda factor: clock)
     components = {}
     def component(name):
@@ -239,9 +241,9 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
     for name in ('infrastructure_description.json', 'workload_description.json', 'pods_allocation.csv'):
         (tmp_path / name).write_text('{}')
     coordinator.PodsMapping.PODS_ALLOCATION_PATH = str(tmp_path / 'pods_allocation.csv')
-    instance = coordinator.Manager(data_path=tmp_path, karpenter=False, hpa=False, speed_factor=2, report=report)
-    assert report.data['configuration']['setup_concurrency'] == 2
-    assert report.data['configuration']['bind_concurrency'] == 2
+    instance = coordinator.Manager(data_path=tmp_path, karpenter=False, hpa=hpa, speed_factor=factor, report=report)
+    assert report.data['configuration']['setup_concurrency'] == factor
+    assert report.data['configuration']['bind_concurrency'] == factor
     instance.collection_diagnostics['complete'] = True
     def prepare_observability():
         assert clock.origin_monotonic is None
@@ -251,8 +253,22 @@ def test_coordinator_prepares_everything_before_fixing_common_origin(monkeypatch
     instance.prepare_observability.assert_called_once()
     assert commands[-1] == ['bash', 'src/port-forward.sh']
     assert clock.origin_monotonic > 100
-    for name in ('InfrastructureManager', 'WorkloadManager'):
-        components[name].emulation.assert_called_once_with(clock)
+    configuration = report.data['configuration']
+    if hpa:
+        # Autoscaling keeps independent producers at 1x and no usage limit.
+        assert instance.replay_coordinator is None
+        assert configuration['replay_coordination'] == 'independent_producers'
+        assert configuration['usage_completion_limit_logical'] is None
+        components['WorkloadManager'].coordinate.assert_not_called()
+        for name in ('InfrastructureManager', 'WorkloadManager'):
+            components[name].emulation.assert_called_once_with(clock)
+    else:
+        assert configuration['replay_coordination'] == 'instant_barriers'
+        assert configuration['usage_completion_limit_logical'] == 30
+        components['WorkloadManager'].coordinate.assert_called_once_with(30)
+        for name in ('InfrastructureManager', 'WorkloadManager'):
+            components[name].emulation.assert_not_called()
+        assert report.data['progress']['coordination']['instants'] == 0
     assert clock.origin_unix == 1700000000
 
 
@@ -282,6 +298,22 @@ def test_usage_process_uses_serialized_interval(monkeypatch):
     usage.run()
     queue.get.assert_called_once_with(timeout=2.5)
     usage_module.K8SAPI.assert_called_once_with(timeout=200)
+
+
+def test_deployment_mutations_return_the_api_response_and_record_identity():
+    api = Mock()
+    applier = KubernetesObjectApplier(api)
+    obj = {'kind': 'Deployment', 'metadata': {'name': 'x', 'namespace': 'ns'}}
+    assert applier.apply_object(obj) is api.patch_namespaced_deployment.return_value
+    api.read_namespaced_deployment.side_effect = ApiException(status=404)
+    assert applier.apply_object(obj) is api.create_namespaced_deployment.return_value
+    api.read_namespaced_deployment.assert_called_with('x', 'ns')  # Unchanged single read.
+    workload = manager(WorkloadManager, [])
+    workload.k8s_api.patch_namespaced_deployment_scale.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(uid='u', generation=None), spec=SimpleNamespace(replicas=4))
+    scaled = workload.scale_workload({'name': 'x', 'namespace': 'ns', 'kind': 'Deployment', 'pods': 4})
+    assert scaled is workload.k8s_api.patch_namespaced_deployment_scale.return_value
+    assert workload.topology[('ns', 'x')] == dict(present=True, uid='u', generation=None, replicas=4)
 
 
 @pytest.mark.parametrize('kind', ['Deployment', 'Node', 'HorizontalPodAutoscaler', 'NodeClaim'])

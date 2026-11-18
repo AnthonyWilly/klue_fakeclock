@@ -349,3 +349,16 @@ def test_delivery_assigns_sequential_ids_only_after_successful_put():
     assert parent.usage_progress['enqueued'] == 2 and parent.usage_progress['pending'] == 2
     assert sorted(parent.usage_tracker.pending) == [1, 2]
     assert parent.usage_tracker.pending[2]['resource'] == 'c'
+
+
+def test_coordinated_event_scaled_to_zero_is_empty_without_reading_the_deployment(caches):
+    from test_replay_coordination import coordinated_event
+    from test_usage_resource_cache import usage_worker
+    from workload.usage.usage_tracking import EMPTY
+    cache = caches(deployments=[deployment('idle')])
+    worker = usage_worker(cache)
+    worker.apply_assignment.side_effect = lambda key, assignment: None
+    outcome = worker.handle_set_usage_event(coordinated_event('idle', dict(uid='d:ns/idle', replicas=0)))
+    assert outcome == EMPTY
+    worker.k8s_api.read_namespaced_deployment.assert_not_called()
+    assert len(cache.fakes.deployments.calls) == 1

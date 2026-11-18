@@ -20,6 +20,7 @@ from sampling import SamplingIntervals, configure_ksm
 from kwok_config import read_workers, WORKERS
 import yaml
 from workload.manager import WorkloadManager
+from replay_coordinator import ReplayCoordinator
 from infrastructure.manager import InfrastructureManager
 from infrastructure.service_monitor.service_monitor_manager import ServiceMonitorManager
 import threading
@@ -61,6 +62,14 @@ class Manager:
             self.report.trace(Path(data_path) / name, 'replay')
         self.infrastructure_manager = InfrastructureManager(f"{data_path}/infrastructure_description.json", karpenter, infrastructure, speed_factor=self.speed_factor)
         self.workload_manager = WorkloadManager(f"{data_path}/workload_description.json", workload, hpa, speed_factor=self.speed_factor)
+        # Autoscalers change topology outside the trace; they keep independent producers at 1x.
+        self.replay_coordinator = None
+        if not karpenter and not hpa:
+            self.replay_coordinator = ReplayCoordinator(self.infrastructure_manager, self.workload_manager)
+            self.workload_manager.coordinate(self.replay_coordinator.limit_logical)
+        self.report.update(configuration=dict(self.report.data['configuration'],
+            replay_coordination='instant_barriers' if self.replay_coordinator else 'independent_producers',
+            usage_completion_limit_logical=self.replay_coordinator.limit_logical if self.replay_coordinator else None))
 
         self.report.trace(PodsMapping.PODS_ALLOCATION_PATH, 'allocation')
         self.pods_mapping = PodsMapping(karpenter)
@@ -242,9 +251,22 @@ class Manager:
         count = usage['completed']
         usage['mean_lag_real'] = usage['total_lag_real'] / count if count else 0
         usage['mean_lag_logical'] = usage['total_lag_logical'] / count if count else 0
+        fidelity = usage.pop('fidelity', None) or {}
         lag['usage'] = {key: value for key, value in usage.items()
                         if 'lag' in key or key in ('worst_event', 'late_events')}
         progress['usage'] = {key: value for key, value in usage.items() if key not in lag['usage']}
+        coordinator = getattr(self, 'replay_coordinator', None)
+        if coordinator is not None:
+            progress['coordination'] = coordinator.snapshot()
+            if self.clock.origin_monotonic is not None:
+                # Part of producers_real: time spent waiting for usage between instants.
+                self.report.timing(usage_barrier_real=progress['coordination']['barrier_wait_real'])
+            violation = fidelity.get('violation')
+            # Additive field: status/replay_complete keep their meaning for consumers.
+            self.report.update(fidelity=dict(
+                limit_logical=fidelity.get('limit_logical'), violation=violation,
+                temporal_valid=bool(final and violation is None
+                                    and self.report.data['timing'].get('replay_complete'))))
         if self.clock.origin_monotonic is not None and not final:
             self.report.timing(progress_logical=max(
                 progress[name]['final_timestamp'] or 0 for name in ('infrastructure', 'workload')))
@@ -281,7 +303,8 @@ class Manager:
             check_interruption()
             while not thread_errors.empty():
                 name, error = thread_errors.get_nowait()
-                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay')
+                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay',
+                             **getattr(error, 'details', {}))
             if self.clock.cancel.is_set():
                 raise RuntimeError('replay cancelled after component failure')
             self.workload_manager.check_usage()
@@ -346,9 +369,12 @@ class Manager:
                 args=('collector', lambda clock: self.collect_loop(clock.origin_unix)),
                 name='CollectorThread', daemon=True)
             collector_thread.start()
-            for name, manager in (('infrastructure', self.infrastructure_manager),
-                                  ('workload', self.workload_manager)):
-                thread = threading.Thread(target=guarded, args=(name, manager.emulation),
+            coordinator = getattr(self, 'replay_coordinator', None)
+            producers = ([('replay', coordinator.run)] if coordinator is not None else
+                         [('infrastructure', self.infrastructure_manager.emulation),
+                          ('workload', self.workload_manager.emulation)])
+            for name, function in producers:
+                thread = threading.Thread(target=guarded, args=(name, function),
                                           name=name, daemon=True)
                 thread.start()
                 threads.append(thread)
@@ -364,8 +390,10 @@ class Manager:
             self.workload_manager.drain_usage(check=check_threads)
             replay_end = self.clock.monotonic()
             report.timing(usage_drain_real=replay_end - producers_end)
-            complete = (not self.workload_manager.usage_progress['failed']
-                        and not self.workload_manager.usage_progress['errors']
+            usage = self.workload_manager.usage_progress
+            complete = (not usage['failed'] and not usage['errors']
+                        and not usage.get('outcomes', {}).get('cancelled')
+                        and not (usage.get('fidelity') or {}).get('violation')
                         and all(not manager.replay_diagnostics.snapshot()['failed_actions']
                                 for manager in (self.infrastructure_manager, self.workload_manager)))
             report.timing(replay_real=replay_end - self.clock.origin_monotonic,
@@ -382,7 +410,7 @@ class Manager:
             self.workload_manager.finish_usage(timeout=230, allow_progress=True, check=check_interruption)
         except BaseException as error:
             interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
-            report.issue(error, component='coordinator')
+            report.issue(error, component='coordinator', **getattr(error, 'details', {}))
         finally:
             self.clock.cancel.set()
             for thread in threads:
@@ -392,7 +420,8 @@ class Manager:
             # Preserve any primary thread exception even if cancellation won the race.
             while not thread_errors.empty():
                 name, error = thread_errors.get_nowait()
-                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay')
+                report.issue(error, component=name, stage='collection' if name == 'collector' else 'replay',
+                             **getattr(error, 'details', {}))
             now = self.clock.monotonic()
             if finalization_start is None:
                 finalization_start = now

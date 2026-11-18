@@ -1,3 +1,4 @@
+from concurrent.futures import TimeoutError as FutureTimeout
 import multiprocessing
 import queue
 import time
@@ -11,7 +12,8 @@ from util.k8s_objects.cluster_resource_usage_generator import ClusterResourceUsa
 from workload.usage.event_dispatcher import EventDispatcher, FairExecutor
 from workload.usage.resource_cache import ResourceCache, is_live_pod, pod_limits
 from workload.usage.usage_assignment import UsageAssignmentEngine
-from workload.usage.usage_tracking import APPLIED, CANCELLED, EMPTY, FAILED, TARGET_ABSENT
+from workload.usage.usage_tracking import (APPLIED, CANCELLED, EMPTY, FAILED, TARGET_ABSENT,
+                                          ReplayFidelityError)
 
 
 class UsageManager(multiprocessing.Process):
@@ -91,6 +93,8 @@ class UsageManager(multiprocessing.Process):
         self.api_lock = None
         self.usage_executor = None
         self.dispatcher = None
+        # Completion deadline of the event running on the current thread.
+        self.event_scope = threading.local()
 
     def log(self, message):
         print(f"[USAGE MANAGER] {message}", flush=True)
@@ -260,6 +264,8 @@ class UsageManager(multiprocessing.Process):
                           started_monotonic=started, finished_monotonic=finished, **fields, **context)
         try:
             outcome = self.handle_set_usage_event(event)
+        except ReplayFidelityError as error:
+            acknowledge(FAILED, message=str(error), fidelity=True)
         except Exception as error:
             acknowledge(FAILED, message=str(error))
         except BaseException:
@@ -273,10 +279,14 @@ class UsageManager(multiprocessing.Process):
     # Event handling
     # --------------------------------------------------
 
-    def handle_set_usage_event(self, event):
+    def handle_set_usage_event(self, event, monotonic=time.monotonic):
         """
         Store the latest set-usage event for a workload and reconcile that workload.
         Return the reconciliation outcome.
+
+        An event of the coordinated replay carries the topology its workload
+        must show and a completion deadline. It is applied only to that
+        observed topology; waits for it never pass the deadline.
         """
 
         namespace = event["namespace"]
@@ -295,8 +305,21 @@ class UsageManager(multiprocessing.Process):
         with self.state_lock:
             self.last_usage_actions[workload_key] = usage_action
 
+        expected = event.get('expected_topology')
+        deadline = (event.get('replay_timing') or {}).get('usage_deadline_monotonic')
         try:
-            return self.reconcile_workload(workload_key=workload_key)
+            if expected is None:
+                return self.reconcile_workload(workload_key=workload_key)
+            view = self.await_topology(workload_key, expected, deadline, monotonic)
+            if view is None:
+                # The replay deleted, or never created, this workload: legitimate absence.
+                self.cleanup_workload(workload_key)
+                return TARGET_ABSENT
+            self.event_scope.deadline, self.event_scope.monotonic = deadline, monotonic
+            try:
+                return self.reconcile_workload(workload_key, view.keys, view.pods, view.signature)
+            finally:
+                self.event_scope.deadline = None
         except Exception:
             # Periodic reconciliation retries a workload whose event failed.
             with self.state_lock:
@@ -357,6 +380,57 @@ class UsageManager(multiprocessing.Process):
                 self.retry_workloads.add(workload_key)
             self.emit(kind='error', message=str(error), action='periodic-reconciliation',
                       namespace=workload_key[0], resource=workload_key[1])
+
+    @staticmethod
+    def topology_state(view, expected):
+        """Compare a cached view with the topology a confirmed mutation returned."""
+        if not expected.get('present'):
+            return 'ready' if view.deployment_uid is None else 'unexpected'
+        if view.deployment_uid is None:
+            return 'missing'
+        if expected.get('uid') is not None and view.deployment_uid != expected['uid']:
+            return 'uid-mismatch'
+        generation = expected.get('generation')
+        if generation is not None and (view.deployment_generation or 0) < generation:
+            return 'converging'
+        replicas = expected.get('replicas')
+        if replicas is None:
+            replicas = getattr(view, 'deployment_replicas', None)
+        if replicas is not None and len(view.keys) != replicas:
+            return 'converging'
+        return 'ready'
+
+    def await_topology(self, workload_key, expected, deadline, monotonic=time.monotonic):
+        """Cached view showing ``expected``, None for an expected absence.
+
+        A cache still older than the mutation is awaited, never read as an
+        empty assignment. Convergence may take until ``deadline``; an
+        identity that stays wrong for ``CACHE_CATCH_UP_TIMEOUT`` real seconds
+        is a fidelity failure, even with budget left.
+        """
+        cache = self.resource_cache
+        namespace, name = workload_key
+        started = monotonic()
+        while True:
+            now = monotonic()
+            remaining = None if deadline is None else deadline - now
+            view = cache.snapshot(workload_key, self.CACHE_HEALTH_TIMEOUT if remaining is None
+                                  else max(0, min(self.CACHE_HEALTH_TIMEOUT, remaining)))
+            state = self.topology_state(view, expected)
+            if state == 'ready':
+                return view if expected.get('present') else None
+            identity = state in ('missing', 'uid-mismatch', 'unexpected')
+            if remaining is not None and remaining <= 0:
+                raise ReplayFidelityError(
+                    f'{namespace}/{name}: expected topology not observed before the usage deadline '
+                    f'({state}; {len(view.keys)} live pods)')
+            if identity and now - started >= self.CACHE_CATCH_UP_TIMEOUT:
+                raise ReplayFidelityError(f'{namespace}/{name}: observed workload is {state}')
+            limit = self.CACHE_CATCH_UP_TIMEOUT - (now - started) if identity else self.CACHE_HEALTH_TIMEOUT
+            if remaining is not None:
+                limit = min(limit, remaining)
+            cache.wait_for(lambda read: self.topology_state(read(workload_key), expected) == 'ready',
+                           max(0, limit))
 
     def observe_workload(self, workload_key):
         """Cached view of a workload, or None when its deployment is gone.
@@ -486,10 +560,25 @@ class UsageManager(multiprocessing.Process):
             return
         futures = [self.usage_executor.submit(function, *args, group=workload_key)
                    for function, *args in calls]
+        deadline = getattr(self.event_scope, 'deadline', None)
+        monotonic = getattr(self.event_scope, 'monotonic', None) or time.monotonic
         failure = None
         for future in futures:
             try:
-                future.result()
+                if deadline is None:
+                    future.result()
+                else:
+                    future.result(timeout=max(0, deadline - monotonic()))
+            except FutureTimeout:
+                # Issue no further write for an expired event; calls already
+                # running finish within their real API timeout.
+                for pending in futures:
+                    pending.cancel()
+                for pending in futures:
+                    if not pending.cancelled():
+                        pending.exception()
+                raise ReplayFidelityError(
+                    f'{workload_key[0]}/{workload_key[1]}: usage writes did not finish before the usage deadline')
             except Exception as error:
                 failure = failure or error
         if failure is not None:

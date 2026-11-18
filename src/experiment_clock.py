@@ -136,10 +136,14 @@ class ReplayDiagnostics:
                       lag_real=lag, lag_logical=lag * clock.speed_factor)
         with self._lock:
             self._data['attempted_actions'] += 1
+        abort = None
         try:
             action(*args)
         except Exception as error:
             record.update(completed=False, error=str(error))
+            # Errors that invalidate the whole replay are recorded, then stop it.
+            if getattr(error, 'abort_replay', False):
+                abort = error
         else:
             record.update(completed=True, error=None)
         record['finished'] = clock.monotonic()
@@ -147,6 +151,8 @@ class ReplayDiagnostics:
             self._data['completed_actions' if record['completed'] else 'failed_actions'] += 1
             self._data['actions'].append(record)
         print(f"[REPLAY ACTION] {record}", flush=True)
+        if abort is not None:
+            raise abort
         return record
 
 

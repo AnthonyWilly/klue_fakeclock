@@ -43,6 +43,7 @@ def test_exclusive_output_atomic_updates_and_identity(tmp_path, monkeypatch):
     # Additive fields start null; legacy fields keep their names.
     assert data['timing']['producers_real'] is None
     assert data['timing']['usage_drain_real'] is None
+    assert data['timing']['usage_barrier_real'] is None  # Only coordinated replays wait on barriers.
     assert data['traces'][0]['sha256'] == hashlib.sha256(trace.read_bytes()).hexdigest()
     assert all(state == 'running' for state in seen)
     assert not list(report.output_dir.glob('.run-*.tmp'))

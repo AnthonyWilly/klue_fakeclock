@@ -136,54 +136,143 @@ class WorkloadManager:
     def emulation(self, clock=None):
         """Replay workload entries without changing trace timestamps or units."""
         clock = clock or ExperimentClock(self.speed_factor).start()
-        diagnostics = self.replay_diagnostics
         for entry, scheduled in replay_entries(
-                self.data['emulation'], clock, diagnostics,
+                self.data['emulation'], clock, self.replay_diagnostics,
                 self.emulation_phase == "dynamic"):
-            for namespace, objects in entry.get('applied_objects', {}).items():
-                for obj in objects:
-                    if self.ignore_hpa(obj):
-                        diagnostics.skip()
-                        continue
-                    diagnostics.apply(
-                        clock, scheduled, {"action": "apply-object", "object": obj},
-                        self.apply_workload_object, namespace, obj)
+            self.apply_entry_objects(entry, clock, scheduled)
             for action in entry.get('workload_actions', []):
-                kind = action['action']
-                if kind == 'set-usage':
-                    # Queue metadata is serializable; the child process starts
-                    # before the common clock origin exists in the parent.
-                    event = dict(action, replay_timing={
-                        "scheduled_monotonic": scheduled,
-                        "trace_timestamp": entry['timestamp'],
-                        "origin_monotonic": clock.origin_monotonic,
-                        "origin_unix": clock.origin_unix,
-                        "speed_factor": clock.speed_factor,
-                    })
-                    diagnostics.apply(clock, scheduled, {"action": "queue-usage"},
-                                      self.set_workload_usage, event, getattr(clock, 'cancel', None))
-                elif kind == 'scale' and not self.hpa:
-                    diagnostics.apply(clock, scheduled, action,
-                                      self.scale_workload, action)
-                elif kind == 'scale':
-                    diagnostics.skip()
-                else:
-                    diagnostics.apply(clock, scheduled, action,
-                                      self.unsupported_action, kind)
-            for obj in entry.get('deleted_objects', []):
+                self.replay_action(action, entry, clock, scheduled)
+            self.delete_entry_objects(entry, clock, scheduled)
+
+    # Each phase keeps the input order of its entry. The coordinated replay
+    # runs them per instant with usage barriers between topology changes.
+
+    def apply_entry_objects(self, entry, clock, scheduled):
+        diagnostics = self.replay_diagnostics
+        for namespace, objects in entry.get('applied_objects', {}).items():
+            for obj in objects:
                 if self.ignore_hpa(obj):
                     diagnostics.skip()
                     continue
-                diagnostics.apply(clock, scheduled,
-                                  {"action": "delete-object", "object": obj},
-                                  self.k8s_object_applier.delete_object, obj)
+                diagnostics.apply(
+                    clock, scheduled, {"action": "apply-object", "object": obj},
+                    self.apply_workload_object, namespace, obj)
 
-    def ignore_hpa(self, obj):
-        return not self.hpa and obj.get('kind', '').lower() == 'horizontalpodautoscaler'
+    def apply_entry_topology(self, entry, clock, scheduled):
+        """Objects, then scale and other non-usage actions of one entry."""
+        self.apply_entry_objects(entry, clock, scheduled)
+        for action in entry.get('workload_actions', []):
+            if action['action'] != 'set-usage':
+                self.replay_action(action, entry, clock, scheduled)
+
+    def publish_entry_usage(self, entry, clock, scheduled):
+        """Deliver the set-usage actions of one entry; return their event ids."""
+        delivered = []
+        for action in entry.get('workload_actions', []):
+            if action['action'] == 'set-usage':
+                self.replay_action(action, entry, clock, scheduled, delivered)
+        return delivered
+
+    def replay_action(self, action, entry, clock, scheduled, delivered=None):
+        diagnostics = self.replay_diagnostics
+        kind = action['action']
+        if kind == 'set-usage':
+            # Queue metadata is serializable; the child process starts
+            # before the common clock origin exists in the parent.
+            timing = {
+                "scheduled_monotonic": scheduled,
+                "trace_timestamp": entry['timestamp'],
+                "origin_monotonic": clock.origin_monotonic,
+                "origin_unix": clock.origin_unix,
+                "speed_factor": clock.speed_factor,
+            }
+            event = dict(action, replay_timing=timing)
+            limit = self.usage_tracker.limit_logical
+            if limit is not None:
+                # The worker waits for this topology and never past this deadline.
+                timing['usage_deadline_monotonic'] = scheduled + limit / clock.speed_factor
+                event['expected_topology'] = self.expected_topology(
+                    (action.get('namespace'), action.get('name')))
+            sink = delivered if delivered is not None else []
+            diagnostics.apply(clock, scheduled, {"action": "queue-usage"},
+                              lambda *args: sink.append(self.set_workload_usage(*args)),
+                              event, getattr(clock, 'cancel', None))
+        elif kind == 'scale' and not self.hpa:
+            diagnostics.apply(clock, scheduled, action, self.scale_workload, action)
+        elif kind == 'scale':
+            diagnostics.skip()
+        else:
+            diagnostics.apply(clock, scheduled, action, self.unsupported_action, kind)
+
+    def delete_entry_objects(self, entry, clock, scheduled):
+        diagnostics = self.replay_diagnostics
+        for obj in entry.get('deleted_objects', []):
+            if self.ignore_hpa(obj):
+                diagnostics.skip()
+                continue
+            diagnostics.apply(clock, scheduled,
+                              {"action": "delete-object", "object": obj},
+                              self.delete_workload_object, obj)
+
+    # ------------------------------------------------------------ topology
+
+    def coordinate(self, limit_logical):
+        """Enable usage deadlines and topology expectations for the replay.
+
+        Expectations start from the setup deployments and follow every
+        confirmed mutation: the API response gives UID, generation and
+        replicas, so no read is issued per usage event.
+        """
+        self.usage_tracker.limit_logical = limit_logical
+        self.topology = {}
+        for namespace, objects in self.data.get('setup', {}).get('applied_objects', {}).items():
+            for obj in objects:
+                if obj.get('kind', '').lower() == 'deployment':
+                    self.topology[(obj['metadata'].get('namespace', namespace), obj['metadata']['name'])] = dict(
+                        present=True, uid=None, generation=None, replicas=None)
+
+    def expected_topology(self, key):
+        expected = getattr(self, 'topology', {}).get(key)
+        return dict(expected) if expected else dict(present=False, uid=None, generation=None, replicas=None)
+
+    def observe_mutation(self, key, response, replicas=None):
+        """Record the identity a confirmed deployment mutation returned."""
+        if not hasattr(self, 'topology'):
+            self.topology = {}
+        metadata = getattr(response, 'metadata', None)
+        spec = getattr(response, 'spec', None)
+        def value(source, name, kind):
+            result = getattr(source, name, None)
+            return result if isinstance(result, kind) and not isinstance(result, bool) else None
+        previous = self.topology.get(key) or {}
+        uid = value(metadata, 'uid', str)
+        same = uid is None or uid == previous.get('uid')
+        observed = value(spec, 'replicas', int)
+        self.topology[key] = dict(
+            present=True,
+            uid=uid or previous.get('uid'),
+            generation=value(metadata, 'generation', int) or (previous.get('generation') if same else None),
+            replicas=observed if observed is not None else replicas)
 
     def apply_workload_object(self, namespace, obj):
         self.create_namespace_if_not_exists(namespace)
-        self.k8s_object_applier.apply_object(obj)
+        response = self.k8s_object_applier.apply_object(obj)
+        if obj.get('kind', '').lower() == 'deployment':
+            spec_replicas = obj.get('spec', {}).get('replicas', 1)
+            self.observe_mutation((obj['metadata'].get('namespace', namespace), obj['metadata']['name']),
+                                  response, spec_replicas)
+        return response
+
+    def delete_workload_object(self, obj):
+        response = self.k8s_object_applier.delete_object(obj)
+        if obj.get('kind', 'Deployment').lower() == 'deployment':
+            key = (obj.get('namespace', obj.get('metadata', {}).get('namespace', 'default')),
+                   obj.get('name', obj.get('metadata', {}).get('name')))
+            getattr(self, 'topology', {}).pop(key, None)
+        return response
+
+    def ignore_hpa(self, obj):
+        return not self.hpa and obj.get('kind', '').lower() == 'horizontalpodautoscaler'
 
     @staticmethod
     def unsupported_action(kind):
@@ -192,6 +281,12 @@ class WorkloadManager:
     def check_usage(self, stopping=False):
         with self.usage_lock:
             self._check_usage(stopping)
+
+    def usage_done(self, event_ids):
+        """True when every event id reached its terminal acknowledgement."""
+        with self.usage_lock:
+            pending = self.usage_tracker.pending
+            return not any(event_id in pending for event_id in event_ids)
 
     def _check_usage(self, stopping=False):
         progress = self.usage_progress
@@ -237,8 +332,13 @@ class WorkloadManager:
                 self.usage_activity = getattr(self, 'usage_activity', 0) + 1
             else:
                 progress['errors'].append(message)
+        tracker.check_deadlines()
         progress['pending'] = len(tracker.pending)
         progress.update(tracker.summary())
+        if tracker.violation is not None and not getattr(self, 'fidelity_raised', False):
+            # Raised once; cleanup and archive keep running after the primary failure.
+            self.fidelity_raised = True
+            raise tracker.violation_error()
         if self.usage_manager.pid is not None and self.usage_manager.exitcode is not None:
             if self.usage_manager.exitcode != 0:
                 raise RuntimeError(f'UsageManager exited with code {self.usage_manager.exitcode}')
@@ -453,6 +553,7 @@ class WorkloadManager:
             with self.usage_lock:
                 self.usage_progress['enqueued'] += 1
                 self.usage_progress['pending'] = len(self.usage_tracker.pending)
+            return event['event_id']
 
     def wait_usage_capacity(self, cancel=None, timeout=UsageManager.TIME_OUT + 30, poll=.05):
         """Wait, interruptibly, until fewer than the admission limit are pending.
@@ -503,7 +604,9 @@ class WorkloadManager:
         replicas = scale_info['pods']
         kind = scale_info['kind'].lower()
         if kind in {"deployment", "statefulset"}:
-            self.k8s_api.patch_namespaced_deployment_scale(
+            response = self.k8s_api.patch_namespaced_deployment_scale(
                 name, namespace, {"spec": {"replicas": replicas}})
+            self.observe_mutation((namespace, name), response, replicas)
+            return response
         else:
             raise ValueError(f"Unsupported scale kind: {kind}")

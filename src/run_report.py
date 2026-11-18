@@ -74,7 +74,7 @@ class RunReport:
                 status='running', stage='validation', configuration=configuration or {},
                 traces=[], timing=dict(started_monotonic=self.monotonic(),
                     preparation_real=None, replay_real=None, producers_real=None,
-                    usage_drain_real=None, finalization_real=None,
+                    usage_drain_real=None, usage_barrier_real=None, finalization_real=None,
                     total_real=None, origin_unix=None, origin_monotonic=None,
                     scheduled_logical=None, progress_logical=None, tail_logical=15,
                     tail_real=None, effective_factor=None, replay_complete=False),

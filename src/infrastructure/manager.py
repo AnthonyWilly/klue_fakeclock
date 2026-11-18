@@ -111,14 +111,23 @@ class InfrastructureManager:
         for entry, scheduled in replay_entries(
                 self.data['emulation'], clock, self.replay_diagnostics,
                 self.emulation_phase == "dynamic"):
-            for node in entry.get('applied_objects', []):
-                self.replay_diagnostics.apply(
-                    clock, scheduled, {"action": "apply-node", "object": node},
-                    self.k8s_object_applier.apply_node, node, node['metadata']['name'])
-            for name in entry.get('deleted_objects', []):
-                self.replay_diagnostics.apply(
-                    clock, scheduled, {"action": "delete-node", "name": name},
-                    self.k8s_api.delete_infrastructure_object, name)
+            self.apply_entry_nodes(entry, clock, scheduled)
+            self.delete_entry_nodes(entry, clock, scheduled)
+
+    # Phases keep the input order of their entry; the coordinated replay
+    # creates nodes before workloads and deletes them after workloads.
+
+    def apply_entry_nodes(self, entry, clock, scheduled):
+        for node in entry.get('applied_objects', []):
+            self.replay_diagnostics.apply(
+                clock, scheduled, {"action": "apply-node", "object": node},
+                self.k8s_object_applier.apply_node, node, node['metadata']['name'])
+
+    def delete_entry_nodes(self, entry, clock, scheduled):
+        for name in entry.get('deleted_objects', []):
+            self.replay_diagnostics.apply(
+                clock, scheduled, {"action": "delete-node", "name": name},
+                self.k8s_api.delete_infrastructure_object, name)
 
     def tear_down(self):
         pass

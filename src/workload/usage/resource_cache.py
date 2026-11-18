@@ -292,6 +292,7 @@ class ResourceCache:
             signature=self._signature(workload_key),
             deployment_uid=deployment.metadata.uid if deployment else None,
             deployment_generation=deployment.metadata.generation if deployment else None,
+            deployment_replicas=getattr(getattr(deployment, "spec", None), "replicas", None),
             deployment_version=self.deployment_versions.get(workload_key, 0),
             absence_confirmed=(deployment is None and self.confirmed_absent.get(workload_key)
                                == self.deployment_versions.get(workload_key, 0)),

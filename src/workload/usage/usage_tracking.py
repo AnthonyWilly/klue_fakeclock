@@ -8,6 +8,11 @@ every earlier event finished, so the contiguous watermark is tracked separately.
 Times are ``time.monotonic`` values, which share one clock across processes on
 the same machine. Setup events have no replay deadline and therefore no logical
 completion lag; their queue age is measured from submission.
+
+With a completion limit, an event of the replay violates temporal fidelity when
+it completes, or is still pending, more than ``limit_logical`` logical seconds
+after its scheduled instant. Exactly the limit is still valid. Only the first
+violation is kept: it is the primary diagnosis of the run.
 """
 import copy
 import time
@@ -23,9 +28,24 @@ OUTCOMES = (APPLIED, EMPTY, TARGET_ABSENT, FAILED, CANCELLED)
 SUCCESSFUL = frozenset((APPLIED, EMPTY, TARGET_ABSENT))
 
 
+class ReplayFidelityError(RuntimeError):
+    """The replay can no longer reproduce the trace at its requested factor.
+
+    ``details`` holds JSON-serializable context for the run report.
+    """
+    abort_replay = True
+
+    def __init__(self, message, **details):
+        super().__init__(message)
+        self.details = details
+
+
 class UsageTracker:
-    def __init__(self, monotonic=None):
+    def __init__(self, monotonic=None, limit_logical=None):
         self.monotonic = monotonic or time.monotonic
+        # Logical seconds an event of the replay may take to complete; None disables.
+        self.limit_logical = limit_logical
+        self.violation = None
         self.next_event_id = 1
         self.pending = {}
         self.active = set()
@@ -102,10 +122,16 @@ class UsageTracker:
             self.execution['count'] += 1
             self.execution['total_real'] += duration
             self.execution['max_real'] = max(self.execution['max_real'], duration)
+        if message.get('fidelity'):
+            # The worker proved the expected topology is not there to receive usage.
+            self._violate(event_id, event, 'topology', state='finished',
+                          message=message.get('message'))
         scheduled = event['scheduled_monotonic']
         if scheduled is not None and finished is not None and outcome != CANCELLED:
             factor = event['speed_factor'] or 1
             lag = max(0, finished - scheduled)
+            if self.limit_logical is not None and lag * factor > self.limit_logical:
+                self._violate(event_id, event, 'completion', state='finished', delay_real=lag)
             completion = self.completion
             completion['replay_events'] += 1
             completion['late'] += int(lag > 0)
@@ -121,6 +147,51 @@ class UsageTracker:
                     finished_monotonic=finished)
         return None
 
+    def check_deadlines(self, now=None):
+        """Record a violation for any pending replay event older than the limit.
+
+        Covers events still in transport, buffered, waiting for topology or
+        running: the limit holds even when no acknowledgement ever arrives.
+        """
+        if self.limit_logical is None or self.violation is not None:
+            return self.violation
+        now = self.monotonic() if now is None else now
+        # Replay events are registered in schedule order, so the first pending
+        # one with a deadline is the oldest. Setup events have no deadline.
+        for event_id, event in self.pending.items():
+            if event['scheduled_monotonic'] is None:
+                continue
+            age = now - event['scheduled_monotonic']
+            if age * (event['speed_factor'] or 1) > self.limit_logical:
+                self._violate(event_id, event, 'pending', delay_real=age,
+                              state='active' if event_id in self.active else 'queued')
+            break
+        return self.violation
+
+    def _violate(self, event_id, event, reason, state, delay_real=None, message=None):
+        if self.violation is not None:
+            return
+        factor = event['speed_factor'] or 1
+        self.violation = dict(
+            reason=reason, event_id=event_id, namespace=event['namespace'],
+            resource=event['resource'], trace_timestamp=event['trace_timestamp'], state=state,
+            delay_real=delay_real, delay_logical=None if delay_real is None else delay_real * factor,
+            limit_logical=self.limit_logical, pending=len(self.pending), detail=message)
+
+    def violation_error(self):
+        violation = self.violation
+        if violation['reason'] == 'topology':
+            text = (f"usage event {violation['event_id']} for {violation['namespace']}/"
+                    f"{violation['resource']} at trace {violation['trace_timestamp']} s found no "
+                    f"expected target: {violation['detail']}")
+        else:
+            text = (f"usage event {violation['event_id']} for {violation['namespace']}/"
+                    f"{violation['resource']} at trace {violation['trace_timestamp']} s was "
+                    f"{violation['state']} {violation['delay_logical']:.3f} logical s "
+                    f"({violation['delay_real']:.3f} real s) after its instant, above the "
+                    f"{violation['limit_logical']} s limit")
+        return ReplayFidelityError('temporal fidelity violated: ' + text, **violation)
+
     def _protocol_error(self, problem, message):
         self.protocol_errors += 1
         return f'usage acknowledgement protocol error ({problem}): event {message.get("event_id")!r}'
@@ -128,7 +199,8 @@ class UsageTracker:
     def oldest_pending(self, now):
         if not self.pending:
             return None
-        event_id = min(self.pending)
+        # Identifiers are registered increasing; dicts keep insertion order.
+        event_id = next(iter(self.pending))
         event = self.pending[event_id]
         reference = event['scheduled_monotonic']
         if reference is None:
@@ -166,4 +238,6 @@ class UsageTracker:
                 max_oldest_pending_age_real=self.max_oldest_pending_age_real,
                 max_oldest_pending_age_logical=self.max_oldest_pending_age_logical),
             execution=execution,
-            completion_lag=completion)
+            completion_lag=completion,
+            fidelity=dict(limit_logical=self.limit_logical,
+                          violation=copy.deepcopy(self.violation)))
