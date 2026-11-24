@@ -65,6 +65,10 @@ contexts:
 			if config.Host != "https://127.0.0.1:18443" {
 				t.Fatalf("unexpected API server %q", config.Host)
 			}
+			limited, err := clientConfig(50, 100)
+			if err != nil || limited.QPS != 50 || limited.Burst != 100 || limited.Host != config.Host {
+				t.Fatalf("rate limit not applied: %v %+v", err, limited)
+			}
 		})
 	}
 }

@@ -51,6 +51,17 @@ def test_script_bulk_confirmation_and_build_every_time(shell):
     assert '--workers 2' in lines[1]
 
 
+def test_script_passes_optional_scheduler_limits(shell):
+    script, env, log, _ = shell
+    subprocess.run(['bash', str(script), '2'], env=env, check=True)
+    default = [line for line in log.read_text().splitlines() if line.startswith('scheduler ')][-1]
+    assert all(flag not in default for flag in ('--timeout', '--qps', '--burst'))
+    env.update(SCHEDULER_TIMEOUT='1200s', SCHEDULER_QPS='80', SCHEDULER_BURST='160')
+    subprocess.run(['bash', str(script), '2'], env=env, check=True)
+    explicit = [line for line in log.read_text().splitlines() if line.startswith('scheduler ')][-1]
+    assert explicit.endswith('--workers 2 --timeout 1200s --qps 80 --burst 160')
+
+
 @pytest.mark.parametrize('failed', ['scheduler', 'build', 'apply', 'missing-map'])
 def test_script_propagates_failure(shell, failed):
     script, env, log, scheduler = shell

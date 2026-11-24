@@ -186,7 +186,9 @@ func runScheduler(ctx context.Context, client kubernetes.Interface, mapping map[
 			bound[key] = pod.UID
 			lock.Unlock()
 			queue.Forget(key)
-		} else if ctx.Err() == nil {
+		} else if ctx.Err() == nil && !deadlineRefusal(err) {
+			// A deadline refusal leaves the pod pending; the deadline branch below
+			// then reports overall progress instead of this single pod.
 			transient := apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsInternalError(err) || apierrors.IsConflict(err) || apierrors.IsNotFound(err)
 			if transient && queue.NumRequeues(key) < 5 {
 				queue.AddRateLimited(key)
@@ -258,7 +260,13 @@ waiting:
 			}
 			lock.Unlock()
 			sort.Strings(pending)
-			err = fmt.Errorf("initial scheduling incomplete (%d/%d), pending %v: %w", len(mapping)-len(pending), len(mapping), pending, ctx.Err())
+			listed := pending
+			more := ""
+			if len(pending) > maxListedPending {
+				listed = pending[:maxListedPending]
+				more = fmt.Sprintf(" (+%d more)", len(pending)-maxListedPending)
+			}
+			err = fmt.Errorf("initial scheduling incomplete: %d/%d pods confirmed; pending %v%s: %w", len(mapping)-len(pending), len(mapping), listed, more, ctx.Err())
 			break waiting
 		}
 	}
@@ -273,25 +281,88 @@ waiting:
 	return err
 }
 
+// maxListedPending bounds the pending keys printed in a deadline error.
+const maxListedPending = 10
+
+// deadlineRefusal reports a request refused because it could not finish before
+// the global deadline, such as client-go's rate limiter declining to wait.
+func deadlineRefusal(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "would exceed context deadline")
+}
+
+const (
+	minimumTimeout = 600 * time.Second
+	timeoutBase    = 60 * time.Second
+	// timeoutPerPod assumes only 4 binds/s, below the 4.94/s observed with
+	// client-go's default 5 QPS, so the deadline holds even without the QPS gain.
+	timeoutPerPod = 250 * time.Millisecond
+)
+
+// schedulingTimeout scales the global deadline with the number of pods to bind.
+func schedulingTimeout(pods int) time.Duration {
+	scaled := timeoutBase + time.Duration(pods)*timeoutPerPod
+	if scaled < minimumTimeout {
+		return minimumTimeout
+	}
+	return scaled
+}
+
+type options struct {
+	mapping string
+	workers int
+	timeout time.Duration // zero selects schedulingTimeout
+	qps     float64
+	burst   int
+}
+
+func parseOptions(args []string) (options, error) {
+	var o options
+	flags := flag.NewFlagSet("custom-scheduler", flag.ContinueOnError)
+	flags.StringVar(&o.mapping, "mapping", "./pods_and_nodes_map.csv", "initial placement CSV")
+	flags.IntVar(&o.workers, "workers", 1, "maximum concurrent binds (1-8)")
+	flags.DurationVar(&o.timeout, "timeout", 0, "global real scheduling deadline (0 scales with the mapping size)")
+	flags.Float64Var(&o.qps, "qps", 50, "client API requests per second")
+	flags.IntVar(&o.burst, "burst", 100, "client API request burst")
+	if err := flags.Parse(args); err != nil {
+		return o, err
+	}
+	if o.workers < 1 || o.workers > 8 || o.timeout < 0 || o.qps <= 0 || o.burst < 1 {
+		return o, fmt.Errorf("invalid workers, timeout, qps or burst")
+	}
+	return o, nil
+}
+
 func loadKubernetesConfig() (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{},
 	).ClientConfig()
 }
 
-func run() error {
-	path := flag.String("mapping", "./pods_and_nodes_map.csv", "initial placement CSV")
-	workers := flag.Int("workers", 1, "maximum concurrent binds (1-8)")
-	timeout := flag.Duration("timeout", 600*time.Second, "global real scheduling deadline")
-	flag.Parse()
-	if *workers < 1 || *workers > 8 || *timeout <= 0 {
-		return fmt.Errorf("invalid workers or timeout")
+// clientConfig sets an explicit rate limit; client-go otherwise caps at 5 QPS.
+func clientConfig(qps float64, burst int) (*rest.Config, error) {
+	config, err := loadKubernetesConfig()
+	if err != nil {
+		return nil, err
 	}
-	mapping, err := loadPodNodeMapping(*path)
+	config.QPS = float32(qps)
+	config.Burst = burst
+	return config, nil
+}
+
+func run() error {
+	o, err := parseOptions(os.Args[1:])
 	if err != nil {
 		return err
 	}
-	config, err := loadKubernetesConfig()
+	mapping, err := loadPodNodeMapping(o.mapping)
+	if err != nil {
+		return err
+	}
+	timeout := o.timeout
+	if timeout == 0 {
+		timeout = schedulingTimeout(len(mapping))
+	}
+	config, err := clientConfig(o.qps, o.burst)
 	if err != nil {
 		return err
 	}
@@ -299,11 +370,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("[SCHEDULER] Binding %d pods: workers=%d qps=%g burst=%d timeout=%s\n", len(mapping), o.workers, o.qps, o.burst, timeout)
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(signals, *timeout)
+	ctx, cancel := context.WithTimeout(signals, timeout)
 	defer cancel()
-	return runScheduler(ctx, client, mapping, *workers)
+	return runScheduler(ctx, client, mapping, o.workers)
 }
 
 func main() {

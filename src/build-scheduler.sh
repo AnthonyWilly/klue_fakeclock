@@ -24,7 +24,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-./custom-scheduler --mapping "$PODS_AND_NODES_MAP" --workers "${1:-1}" &
+scheduler_args=(--mapping "$PODS_AND_NODES_MAP" --workers "${1:-1}")
+# Optional overrides; the binder scales its deadline with the mapping by default.
+if [[ -n "${SCHEDULER_TIMEOUT:-}" ]]; then scheduler_args+=(--timeout "$SCHEDULER_TIMEOUT"); fi
+if [[ -n "${SCHEDULER_QPS:-}" ]]; then scheduler_args+=(--qps "$SCHEDULER_QPS"); fi
+if [[ -n "${SCHEDULER_BURST:-}" ]]; then scheduler_args+=(--burst "$SCHEDULER_BURST"); fi
+./custom-scheduler "${scheduler_args[@]}" &
 scheduler_pid=$!
 wait "$scheduler_pid"
 scheduler_pid=""

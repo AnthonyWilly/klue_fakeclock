@@ -357,3 +357,70 @@ func TestBindResponseDoesNotHideWrongObservedDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSchedulingTimeoutScalesWithPods(t *testing.T) {
+	for pods, expected := range map[int]time.Duration{
+		0:    600 * time.Second,
+		2195: 608750 * time.Millisecond,
+		3713: 988250 * time.Millisecond,
+	} {
+		if got := schedulingTimeout(pods); got != expected {
+			t.Fatalf("%d pods: got %s, want %s", pods, got, expected)
+		}
+	}
+	// The scaled deadline covers the mapping even at the old 5 QPS client limit.
+	if schedulingTimeout(3713) < time.Duration(3713/5)*time.Second {
+		t.Fatal("deadline below the default client-go throughput")
+	}
+}
+
+func TestParseOptions(t *testing.T) {
+	o, err := parseOptions(nil)
+	if err != nil || o.workers != 1 || o.timeout != 0 || o.qps != 50 || o.burst != 100 {
+		t.Fatalf("defaults: %v %+v", err, o)
+	}
+	o, err = parseOptions([]string{"--workers", "2", "--timeout", "90s", "--qps", "20", "--burst", "40"})
+	if err != nil || o.workers != 2 || o.timeout != 90*time.Second || o.qps != 20 || o.burst != 40 {
+		t.Fatalf("explicit: %v %+v", err, o)
+	}
+	for _, args := range [][]string{{"--workers", "0"}, {"--timeout", "-1s"}, {"--qps", "0"}, {"--burst", "0"}} {
+		if _, err := parseOptions(args); err == nil {
+			t.Fatalf("%v accepted", args)
+		}
+	}
+}
+
+func TestDeadlineRefusalReportsProgress(t *testing.T) {
+	done, refused := pod("a", "p", ""), pod("b", "q", "")
+	c := fake.NewSimpleClientset(done, refused)
+	var refusals atomic.Int32
+	client := bindingClient{c, func(_ context.Context, b *corev1.Binding) error {
+		if b.Namespace == "b" {
+			refusals.Add(1)
+			return fmt.Errorf("client rate limiter Wait returned an error: %w", errors.New("rate: Wait(n=1) would exceed context deadline"))
+		}
+		return observe(c, b)
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := runScheduler(ctx, client, placement(done, refused), 2)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "1/2 pods confirmed") || !strings.Contains(err.Error(), "b/q->node-b") {
+		t.Fatal(err)
+	}
+	if refusals.Load() != 1 {
+		t.Fatal(refusals.Load())
+	}
+}
+
+func TestDeadlineErrorBoundsPendingList(t *testing.T) {
+	pods := []*corev1.Pod{}
+	for i := 0; i < maxListedPending+5; i++ {
+		pods = append(pods, pod(fmt.Sprintf("ns%02d", i), "p", ""))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	err := runScheduler(ctx, fake.NewSimpleClientset(), placement(pods...), 1)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "0/15 pods confirmed") || !strings.Contains(err.Error(), "(+5 more)") || strings.Contains(err.Error(), "ns14/p") {
+		t.Fatal(err)
+	}
+}
