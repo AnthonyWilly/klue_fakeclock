@@ -9,6 +9,7 @@ from util.k8s_api.k8s_api import K8SAPI
 class PodsMapping:
     PODS_ALLOCATION_PATH = '/tmp/pods_allocation.csv'
     PODS_AND_NODES_PATH = '/tmp/pods_and_nodes_map.csv'
+    issue_handler = None
 
     def __init__(self, karpenter):
         self.k8s_api = K8SAPI()
@@ -75,12 +76,23 @@ class PodsMapping:
         available = {}
         for key, count in expected.items():
             pods = sorted(owners_with_pods.get(key, []))
+            if count and not pods:
+                # As in the original Klue: an owner the setup never created
+                # (e.g. a ReplicaSet without a Deployment) gets no placement.
+                self.log(f'[WARNING] Skipping initial placement for {key}: expected {count} pods, none exist')
+                if self.issue_handler:
+                    self.issue_handler(f'Initial placement skipped for {key[0]}/{key[1]}: '
+                                       f'expected {count} pods, none were created at setup',
+                                       namespace=key[0], owner=key[1], expected=int(count))
+                continue
             if len(pods) != count or len(set(pods)) != len(pods):
                 raise ValueError(f'Pod coverage for {key}: expected {count}, found {len(pods)} (must be unique)')
             available[key] = iter(pods)
         rows = []
         for _, row in self.pods_allocation.iterrows():
             key = (row['namespace'], row['replicaset'])
+            if key not in available:
+                continue
             for _ in range(row['pods_count']):
                 rows.append(dict(pod=next(available[key]), namespace=row['namespace'], node=row['node']))
         result = pd.DataFrame(rows, columns=['pod', 'namespace', 'node'])

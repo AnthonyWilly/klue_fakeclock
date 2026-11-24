@@ -74,6 +74,8 @@ class Manager:
 
         self.report.trace(PodsMapping.PODS_ALLOCATION_PATH, 'allocation')
         self.pods_mapping = PodsMapping(karpenter)
+        self.pods_mapping.issue_handler = lambda message, **context: self.report.issue(
+            message, warning=True, component='pods_mapping', stage='preparation', **context)
         self.collector = Collector(step=self.intervals.query, intervals=self.intervals)
         self.service_monitor_manager = ServiceMonitorManager(interval_seconds=self.intervals.kwok)
         self.service_monitor_manager.issue_handler = lambda error, **context: self.report.issue(

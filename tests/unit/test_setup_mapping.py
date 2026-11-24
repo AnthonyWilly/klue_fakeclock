@@ -119,3 +119,29 @@ def test_namespace_is_read_as_literal_identity(mapping, namespace):
     mapper.k8s_api.list_pod_for_all_namespaces.return_value.items = [
         pod(namespace, f'p{i}', 'owner') for i in range(3)]
     assert mapper.run()['namespace'].tolist() == [namespace] * 3
+
+
+def test_owner_never_created_is_skipped_like_original_klue(mapping):
+    # Orphan ReplicaSet: in the allocation, but setup creates no pods for it.
+    mapper, frame = mapping
+    orphan = pd.DataFrame([
+        dict(namespace='a', replicaset='orphan-rs', node='original-a', instance_type='small', pods_count=1),
+        dict(namespace='a', replicaset='orphan-rs', node='original-b', instance_type='small', pods_count=1)])
+    pd.concat([frame, orphan], ignore_index=True).to_csv(mapper.PODS_ALLOCATION_PATH, index=False)
+    mapper.issue_handler = Mock()
+    expected = [dict(pod='p1', namespace='a', node='fake-a'),
+                dict(pod='p2', namespace='a', node='fake-b'),
+                dict(pod='p1', namespace='b', node='fake-b')]
+    assert mapper.run().to_dict('records') == expected
+    assert pd.read_csv(mapper.PODS_AND_NODES_PATH).to_dict('records') == expected
+    mapper.issue_handler.assert_called_once()
+    assert mapper.issue_handler.call_args.kwargs == dict(namespace='a', owner='orphan-rs', expected=2)
+
+
+def test_partially_created_owner_still_fails(mapping):
+    mapper, frame = mapping
+    mapper.k8s_api.list_pod_for_all_namespaces.return_value.items.pop(0)
+    mapper.issue_handler = Mock()
+    with pytest.raises(ValueError, match='Pod coverage'):
+        mapper.run()
+    mapper.issue_handler.assert_not_called()
