@@ -4,7 +4,7 @@
 #
 # Uso:
 #   ./run-chain.sh <trace> <run> [<run> ...]
-#     <trace>  caminho do trace (relativo ao fork ou absoluto)
+#     <trace>  caminho do trace (relativo à pasta atual ou absoluto)
 #     <run>    orig        -> Klue original em 1x
 #              fork:<F>    -> fork com --speed-factor F
 #
@@ -16,8 +16,8 @@
 #   <n>-<run>.log           emulação (com `real` no fim)
 #   summary.tsv             tempos em segundos de cada etapa
 
-ORIG_DIR=${ORIG_DIR:-$HOME/klue}
-FORK_DIR=${FORK_DIR:-$HOME/klue_fakeclock}
+FORK_DIR=${FORK_DIR:-$(cd "$(dirname "$0")" && pwd)}
+ORIG_DIR=${ORIG_DIR:-$(dirname "$FORK_DIR")/klue}
 
 if [[ $# -lt 2 ]]; then
     sed -n '2,19p' "$0"
@@ -25,11 +25,12 @@ if [[ $# -lt 2 ]]; then
 fi
 
 TRACE=$1; shift
-[[ $TRACE != /* ]] && TRACE="$FORK_DIR/$TRACE"
 if [[ ! -d $TRACE ]]; then
     echo "Trace não encontrado: $TRACE"
     exit 1
 fi
+# Caminho absoluto e sem / no fim, como o execute-emulation.sh espera.
+TRACE=$(cd "$TRACE" && pwd)
 
 LOG_DIR="$HOME/run-logs/$(basename "${TRACE%/}")_$(date +%Y-%m-%d-%H%M%S)"
 mkdir -p "$LOG_DIR"
@@ -43,6 +44,14 @@ echo "Logs:  $LOG_DIR"
 cleanup_leftovers() {
     pkill -f 'kubectl port-forward' 2>/dev/null || true
 }
+
+# Encerra o tail que espelha o log na tela, inclusive se o script sair no meio.
+TAIL_PID=
+stop_tail() {
+    [[ -n $TAIL_PID ]] && kill "$TAIL_PID" 2>/dev/null
+    TAIL_PID=
+}
+trap stop_tail EXIT
 
 n=0
 for spec in "$@"; do
@@ -70,12 +79,18 @@ for spec in "$@"; do
         exit 1
     fi
 
-    # Sem pipe para o tee: processos filhos que sobrevivem não travam a cadeia.
-    # Acompanhe com: tail -f "$LOG_DIR/$name.log"
+    # A saída vai para o log e um tail a repete na tela. Sem pipe para o tee:
+    # processos filhos que sobrevivem não travam a cadeia.
+    log="$LOG_DIR/$name.log"
+    : > "$log"
+    tail -n +1 -f "$log" &
+    TAIL_PID=$!
     { time ./execute-emulation.sh --sim --use-cluster minikube --data-path "$TRACE" "${args[@]}"; } \
-        > "$LOG_DIR/$name.log" 2>&1
+        >> "$log" 2>&1
     code=$?
     t2=$(date +%s)
+    sleep 1
+    stop_tail
     cleanup_leftovers
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$spec" "$(date -d @"$t0" '+%F %T')" $((t1 - t0)) $((t2 - t1)) "$code" >> "$SUMMARY"
