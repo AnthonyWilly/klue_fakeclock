@@ -96,6 +96,22 @@ class UsageManager(multiprocessing.Process):
         # Completion deadline of the event running on the current thread.
         self.event_scope = threading.local()
 
+    # Thread synchronization state belongs to one process. Start methods that
+    # pickle the process (forkserver, the Linux default since Python 3.14, and
+    # spawn) send it without that state and the child creates its own.
+    _PROCESS_LOCAL_STATE = ('state_lock', 'event_scope')
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for name in self._PROCESS_LOCAL_STATE:
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.state_lock = threading.RLock()
+        self.event_scope = threading.local()
+
     def log(self, message):
         print(f"[USAGE MANAGER] {message}", flush=True)
 
